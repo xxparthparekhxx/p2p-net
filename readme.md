@@ -123,16 +123,16 @@ pip install -r requirements.txt
 
 ### **Usage**
 
-To start a node:
+To start a Introduction server:
 
 ```bash
-python main.py --start-node
+python introduction_server.py
 ```
 
-To query the DHT:
+To start a Node (currently it is initalizing 10 nodes and connecting each other and registering 2 domians and it checks if it is able to retirve the vIP address of the node):
 
 ```bash
-python main.py --query <domain_name>
+python p2p_node.py
 ```
 
 ## **Contributing**
