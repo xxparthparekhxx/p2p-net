@@ -762,3 +762,43 @@ async def test_malformed_find_requests_get_an_empty_reply():
         loop.set_exception_handler(old_handler)
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_bad_node_lists_in_lookup_replies_are_ignored():
+    """A peer answering with a malformed node list (string ids, unhashable
+    ids, missing fields) counts as no answer instead of crashing the lookup."""
+    key = 8000
+    owner = Ed25519PrivateKey.generate()
+    bad_lists = [
+        [{'id': "x", 'ip': IP, 'port': 1}],
+        [{'id': [1], 'ip': IP, 'port': 1}],
+        [{'id': 1.5, 'ip': IP, 'port': 1}],
+        [{'id': 3, 'ip': 7, 'port': 1}],
+        [{'id': 3, 'ip': IP, 'port': "1"}],
+        [{'id': 3, 'ip': IP}],
+        ["not a node"],
+        "not a list",
+    ]
+    honest = KademliaNode(8001, IP, 0)
+    servers = [await start_node(honest)]
+    try:
+        assert await rpc(honest.port, make_store_payload(owner, key, "10.0.0.1")[0]) == b"OK"
+        for nodes in bad_lists:
+            for request_reply in ({'nodes': nodes}, nodes):
+                server, port = await start_reply_server(json.dumps(request_reply).encode())
+                servers.append(server)
+        client = KademliaNode(7, IP, 0)
+        client.routing_table.add(Node(honest.id, IP, honest.port))
+        fake_ports = [s.sockets[0].getsockname()[1] for s in servers[1:]]
+        for i, port in enumerate(fake_ports[::2]):
+            client.routing_table.add(Node(8100 + i, IP, port))
+        value, _ = await client.find_value(key)
+        assert value == "10.0.0.1"
+
+        client = KademliaNode(7, IP, 0)
+        for i, port in enumerate(fake_ports[1::2]):
+            client.routing_table.add(Node(8200 + i, IP, port))
+        await client.find_node(key)  # must not raise
+    finally:
+        await close_all(servers)

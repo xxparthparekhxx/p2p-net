@@ -122,6 +122,30 @@ def parse_record_reply(key: int, reply) -> VerifiedRecord:
     return VerifiedRecord(value, seq, owner, signature)
 
 
+def parse_node_list(entries) -> List["Node"]:
+    """Turn an untrusted JSON node list into Node objects, or raise ValueError.
+
+    Ids must be ints in [0, 2**ID_BITS), ips strings and ports ints in
+    1..65535; a string or list id would otherwise raise later in the lookup's
+    XOR sort or set(), outside any try block.
+    """
+    if not isinstance(entries, list):
+        raise ValueError("node list is not a list")
+    nodes = []
+    for n in entries:
+        if not isinstance(n, dict):
+            raise ValueError("node entry is not an object")
+        node_id, ip, port = n.get('id'), n.get('ip'), n.get('port')
+        if not (_is_int(node_id) and 0 <= node_id < 2 ** ID_BITS):
+            raise ValueError("node id is not a valid id")
+        if not isinstance(ip, str):
+            raise ValueError("node ip is not a string")
+        if not (_is_int(port) and 0 < port < 65536):
+            raise ValueError("node port is not a valid port")
+        nodes.append(Node(node_id, ip, port))
+    return nodes
+
+
 class Node:
     def __init__(self, id: int, ip: str, port: int, public_key: bytes = None):
         self.id = id
@@ -481,8 +505,7 @@ class KademliaNode:
             response = await self.protocol._read_message(reader)
             writer.close()
             await writer.wait_closed()
-            nodes_data = json.loads(response.decode())
-            return [Node(n['id'], n['ip'], n['port']) for n in nodes_data]
+            return parse_node_list(json.loads(response.decode()))
         except Exception as e:
             print(f"Failed to find_node on {node.id}: {e}")
             return []
@@ -569,7 +592,7 @@ class KademliaNode:
                                      "than expected")
                 return record
             if isinstance(result, dict) and 'nodes' in result:
-                return [Node(n['id'], n['ip'], n['port']) for n in result['nodes']]
+                return parse_node_list(result['nodes'])
             raise ValueError("reply has neither a record nor a node list")
         except Exception as e:
             print(f"Rejecting FIND_VALUE reply from node {node.id}: {e}")
