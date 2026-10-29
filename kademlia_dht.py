@@ -152,7 +152,16 @@ class KademliaProtocol:
             await self._send_message(writer, b"REJECTED")
             return
 
-        self.kademlia_node.data[key] = value
+        # Names are owned on first use: the first valid signed STORE binds the
+        # name to the signer's public key. A later STORE signed by a different
+        # key is rejected; the rightful owner can keep updating the record.
+        record = self.kademlia_node.data.get(key)
+        if record is not None and record[0] != public_key_bytes:
+            print(f"Rejecting STORE: key {key} is owned by a different key")
+            await self._send_message(writer, b"REJECTED")
+            return
+
+        self.kademlia_node.data[key] = (public_key_bytes, value)
         print(f"Stored key-value pair: {key} {value}")
         await self._send_message(writer, b"OK")
 
@@ -172,7 +181,13 @@ class KademliaProtocol:
         _, key_s = payload.decode().split()
         key = int(key_s)
         if key in self.kademlia_node.data:
-            response = json.dumps({'value': self.kademlia_node.data[key]})
+            # Return the owner public key alongside the value so lookups can
+            # verify who owns the name.
+            owner, value = self.kademlia_node.data[key]
+            response = json.dumps({
+                'value': value,
+                'owner': base64.b64encode(owner).decode(),
+            })
         else:
             closest_nodes = self.kademlia_node.routing_table.find_closest(key)
             response = json.dumps(
@@ -188,9 +203,16 @@ class KademliaNode:
         self.ip = ip
         self.port = port
         self.routing_table = RoutingTable(id)
-        self.data: Dict[int, str] = {}
+        # Maps key -> (owner public key bytes, value). The owner key is the
+        # Ed25519 public key of whoever first stored the name (see
+        # KademliaProtocol.handle_store).
+        self.data: Dict[int, Tuple[bytes, str]] = {}
         # Long-term signing key used to sign records this node stores.
         self.signing_key = Ed25519PrivateKey.generate()
+        # This node's own public key, the owner recorded for names it stores.
+        self.owner_public_key = self.signing_key.public_key().public_bytes(
+            Encoding.Raw, PublicFormat.Raw
+        )
         self.protocol = KademliaProtocol(id, self)
 
     async def bootstrap(self, bootstrap_nodes: List[Node]):
@@ -215,7 +237,13 @@ class KademliaNode:
         store_tasks = []
         for node in nodes:
             if node.id == self.id:
-                self.data[key] = value
+                # Same ownership rule as handle_store: never take over a name
+                # owned by a different key, even in our local cache.
+                record = self.data.get(key)
+                if record is not None and record[0] != self.owner_public_key:
+                    print(f"Refusing to store key {key}: owned by a different key")
+                    continue
+                self.data[key] = (self.owner_public_key, value)
             else:
                 store_tasks.append(self._store_on_node(node, key, value))
         await asyncio.gather(*store_tasks)
@@ -269,7 +297,8 @@ class KademliaNode:
         print(f"find_value  for key {key} on node {self.id} {self.data} ")
 
         if key in self.data:
-            return self.data[key], []
+            owner, value = self.data[key]
+            return value, []
         nodes = self.routing_table.find_closest(key)
         if not nodes:
             return None, []
@@ -281,15 +310,19 @@ class KademliaNode:
             query_tasks = [self._find_value_on_node(node, key) for node in unqueried]
             results = await asyncio.gather(*query_tasks)
             for result in results:
-                if isinstance(result, str):
-                    return result, []
+                if isinstance(result, tuple):
+                    # (value, owner) hit; the owner key is available for
+                    # verification but the lookup itself returns the value.
+                    return result[0], []
                 elif result:
                     nodes.extend(result)
             queried_nodes.update(unqueried)
             nodes = sorted(set(nodes), key=lambda n: n.id ^ key)[:K]
         return None, nodes
 
-    async def _find_value_on_node(self, node: Node, key: int) -> Union[str, List[Node], None]:
+    async def _find_value_on_node(
+        self, node: Node, key: int
+    ) -> Union[Tuple[str, Optional[bytes]], List[Node], None]:
         try:
             reader, writer = await asyncio.open_connection(node.ip, node.port)
             await self.protocol.find_value(writer, key)
@@ -300,7 +333,12 @@ class KademliaNode:
             try:
                 result = json.loads(response.decode())
                 if 'value' in result:
-                    return result['value']
+                    # The owner public key (base64) accompanies stored values.
+                    owner = (
+                        base64.b64decode(result['owner'])
+                        if result.get('owner') else None
+                    )
+                    return result['value'], owner
                 elif 'nodes' in result:
                     return [Node(n['id'], n['ip'], n['port']) for n in result['nodes']]
             except json.JSONDecodeError:

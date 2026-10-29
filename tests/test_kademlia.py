@@ -144,6 +144,61 @@ async def rpc(port, payload):
 
 
 @pytest.mark.asyncio
+async def test_store_binds_name_to_first_signer():
+    """TOFU ownership: first signed STORE wins, other keys are rejected."""
+    node = KademliaNode(1, IP, 0)
+    server = await start_node(node)
+    owner = Ed25519PrivateKey.generate()
+    attacker = Ed25519PrivateKey.generate()
+    key = 12345
+    try:
+        # The first valid signed STORE binds the name to the signer's key.
+        assert await rpc(node.port, make_store_payload(owner, key, "10.0.0.1")) == b"OK"
+        assert node.data[key] == (
+            owner.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
+            "10.0.0.1",
+        )
+
+        # An attacker with a different key is rejected, value unchanged.
+        assert await rpc(
+            node.port, make_store_payload(attacker, key, "10.0.0.666")
+        ) == b"REJECTED"
+        assert node.data[key] == (
+            owner.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
+            "10.0.0.1",
+        )
+
+        # The rightful owner can still update the record.
+        assert await rpc(node.port, make_store_payload(owner, key, "10.0.0.2")) == b"OK"
+        assert node.data[key] == (
+            owner.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
+            "10.0.0.2",
+        )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_find_value_returns_owner_key():
+    """FIND_VALUE replies with the owner public key next to the value."""
+    node = KademliaNode(1, IP, 0)
+    server = await start_node(node)
+    owner = Ed25519PrivateKey.generate()
+    key = 54321
+    try:
+        await rpc(node.port, make_store_payload(owner, key, "10.0.0.7"))
+        reply = await rpc(node.port, f"FIND_VALUE {key}".encode())
+        result = json.loads(reply.decode())
+        assert result['value'] == "10.0.0.7"
+        expected_owner = owner.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        assert base64.b64decode(result['owner']) == expected_owner
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_store_accepts_values_with_spaces():
     """Regression: values with spaces ("hello world") are stored verbatim."""
     node = KademliaNode(1, IP, 0)
@@ -154,7 +209,11 @@ async def test_store_accepts_values_with_spaces():
         assert await rpc(
             node.port, make_store_payload(owner, key, "hello world")
         ) == b"OK"
-        assert node.data[key] == "hello world"
+        owner_key, value = node.data[key]
+        assert value == "hello world"
+        assert owner_key == owner.public_key().public_bytes(
+            Encoding.Raw, PublicFormat.Raw
+        )
 
         reply = await rpc(node.port, f"FIND_VALUE {key}".encode())
         assert json.loads(reply.decode())['value'] == "hello world"
