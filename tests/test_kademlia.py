@@ -1063,3 +1063,51 @@ async def test_unreachable_contact_does_not_stall_a_lookup(monkeypatch):
             sock.close()
         server.close()
         await server.wait_closed()
+
+
+# --- Local copy ---
+
+
+@pytest.mark.asyncio
+async def test_store_writes_the_local_copy():
+    """store() keeps a copy on the storing node itself, which is never in its
+    own routing table: the node counts as one of the K closest candidates."""
+    node_a = make_node(1)
+    node_b = make_node(2)
+    server_b = await start_node(node_b)
+    key = 12000
+    try:
+        node_a.routing_table.add(Node(node_b.id, node_b.ip, node_b.port))
+        assert all(n.id != node_a.id
+                   for n in node_a.routing_table.find_closest(key))
+        await node_a.store(key, "10.0.0.12")
+
+        assert key in node_a.data
+        owner, seq, value, signature = node_a.data[key]
+        assert (owner, value) == (node_a.owner_public_key, "10.0.0.12")
+        assert verify_record(key, seq, value.encode(), owner, signature)
+        assert node_b.data[key] == node_a.data[key]
+
+        # A node with no contacts at all still keeps its own copy.
+        alone = make_node(3)
+        await alone.store(key, "10.0.0.13")
+        assert alone.data[key][2] == "10.0.0.13"
+        value, _ = await alone.find_value(key)
+        assert value == "10.0.0.13"
+    finally:
+        server_b.close()
+        await server_b.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_local_copy_follows_the_ownership_rule():
+    """The local copy goes through the same rules as a peer's STORE: a name
+    this node holds for another owner is not taken over."""
+    node = make_node(1)
+    other = Ed25519PrivateKey.generate()
+    key = 12100
+    seq = time.time_ns()
+    signature = other.sign(record_message(key, seq, b"10.0.0.1"))
+    assert node.put_record(key, pub(other), seq, "10.0.0.1", signature)[0]
+    await node.store(key, "6.6.6.6")
+    assert node.data[key][:3] == (pub(other), seq, "10.0.0.1")

@@ -435,42 +435,15 @@ class KademliaProtocol:
             await self._send_message(writer, b"REJECTED")
             return
 
-        # Names are owned on first use: the first valid signed STORE binds the
-        # name to the signer's public key. A later STORE signed by a different
-        # key is rejected; the rightful owner can keep updating the record,
-        # but only with a strictly greater sequence number (an equal seq with
-        # the identical value is an idempotent no-op). The signature is kept
-        # with the record so FIND_VALUE can hand out a self-verifying record.
-        record = self.kademlia_node.data.get(key)
-        if record is None:
-            self.kademlia_node.data[key] = (public_key_bytes, seq, value, signature)
-            print(f"Stored key-value pair: {key} {value}")
-            await self._send_message(writer, b"OK")
-            return
-
-        owner_pubkey, stored_seq, stored_value, _ = record
-        if owner_pubkey != public_key_bytes:
-            print(f"Rejecting STORE: key {key} is owned by a different key")
-            await self._send_message(writer, b"REJECTED")
-            return
-
-        if seq > stored_seq:
-            self.kademlia_node.data[key] = (public_key_bytes, seq, value, signature)
-            print(f"Updated key-value pair: {key} {value}")
-            await self._send_message(writer, b"OK")
-            return
-
-        if seq == stored_seq and value == stored_value:
-            # Idempotent re-store: OK but nothing changes.
-            print(f"Idempotent re-store of key {key}: no change")
-            await self._send_message(writer, b"OK")
-            return
-
-        print(
-            f"Rejecting STORE: key {key} seq {seq} not greater than "
-            f"stored seq {stored_seq}"
+        accepted, message = self.kademlia_node.put_record(
+            key, public_key_bytes, seq, value, signature
         )
-        await self._send_message(writer, b"REJECTED")
+        if accepted:
+            print(message)
+            await self._send_message(writer, b"OK")
+        else:
+            print(f"Rejecting STORE: {message}")
+            await self._send_message(writer, b"REJECTED")
 
     @staticmethod
     def _parse_id_request(payload: bytes, command: str) -> Optional[int]:
@@ -561,6 +534,35 @@ class KademliaNode:
     def sign_record(self, key: int, seq: int, value_bytes: bytes) -> bytes:
         return self.signing_key.sign(record_message(key, seq, value_bytes))
 
+    def put_record(self, key: int, owner: bytes, seq: int, value: str,
+                   signature: bytes) -> Tuple[bool, str]:
+        """Apply this node's storage rules to a record whose signature has
+        already been checked; return (accepted, message to log).
+
+        Used for STOREs from peers and for this node's own local copy alike.
+        Names are owned on first use: the first record for a name binds it to
+        the signer's public key. A record signed by a different key is
+        refused; the owner can keep updating the record, but only with a
+        strictly greater seq (an equal seq with the identical value is an
+        idempotent no-op). The signature is kept with the record so
+        FIND_VALUE can hand out a self-verifying record.
+        """
+        record = self.data.get(key)
+        if record is None:
+            self.data[key] = (owner, seq, value, signature)
+            return True, f"Stored key-value pair: {key} {value}"
+
+        stored_owner, stored_seq, stored_value, _ = record
+        if stored_owner != owner:
+            return False, f"key {key} is owned by a different key"
+        if seq > stored_seq:
+            self.data[key] = (owner, seq, value, signature)
+            return True, f"Updated key-value pair: {key} {value}"
+        if seq == stored_seq and value == stored_value:
+            return True, f"Idempotent re-store of key {key}: no change"
+        return False, (f"key {key} seq {seq} not greater than stored seq "
+                       f"{stored_seq}")
+
     async def bootstrap(self, bootstrap_nodes: List[Node]):
         for node in bootstrap_nodes:
             await self.ping(node)
@@ -584,17 +586,21 @@ class KademliaNode:
         # verifiable) wherever it is stored.
         seq = time.time_ns()
         signature = self.sign_record(key, seq, value.encode())
-        nodes = self.routing_table.find_closest(key)
+        # This node is a candidate replica too: it is never in its own routing
+        # table, so without adding it here the local copy was never written.
+        me = Node(self.id, self.ip, self.port)
+        candidates = set(self.routing_table.find_closest(key)) | {me}
+        nodes = sorted(candidates, key=lambda n: n.id ^ key)[:K]
         store_tasks = []
         for node in nodes:
             if node.id == self.id:
-                # Same ownership rule as handle_store: never take over a name
-                # owned by a different key, even in our local cache.
-                record = self.data.get(key)
-                if record is not None and record[0] != self.owner_public_key:
-                    print(f"Refusing to store key {key}: owned by a different key")
-                    continue
-                self.data[key] = (self.owner_public_key, seq, value, signature)
+                # Same rules as a STORE from a peer: never take over a name
+                # owned by a different key, even in our local copy.
+                accepted, message = self.put_record(
+                    key, self.owner_public_key, seq, value, signature
+                )
+                if not accepted:
+                    print(f"Not storing local copy: {message}")
             else:
                 store_tasks.append(
                     self._store_on_node(node, key, value, seq, signature)
