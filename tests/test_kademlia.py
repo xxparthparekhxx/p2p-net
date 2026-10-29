@@ -1209,3 +1209,38 @@ async def test_large_binary_value_round_trips_and_oversize_is_rejected():
     finally:
         server.close()
         await server.wait_closed()
+
+
+# --- Record cap ---
+
+
+@pytest.mark.asyncio
+async def test_max_records_is_enforced(monkeypatch):
+    """Past MAX_RECORDS a STORE for a new name is REJECTED, while the owner
+    of a name already stored can still update it; the local copy obeys the
+    same cap."""
+    import kademlia_dht
+    assert kademlia_dht.MAX_RECORDS == 10_000
+    monkeypatch.setattr(kademlia_dht, "MAX_RECORDS", 3)
+    node = make_node(1)
+    server = await start_node(node)
+    owner = Ed25519PrivateKey.generate()
+    try:
+        for key in (15001, 15002, 15003):
+            payload, _ = make_store_payload(owner, key, "10.0.0.1")
+            assert await rpc(node.port, payload) == b"OK"
+        payload, _ = make_store_payload(owner, 15004, "10.0.0.1")
+        assert await rpc(node.port, payload) == b"REJECTED"
+        assert len(node.data) == 3 and 15004 not in node.data
+
+        # Updating an existing name is still accepted at the cap.
+        payload, _ = make_store_payload(owner, 15002, "10.0.0.2")
+        assert await rpc(node.port, payload) == b"OK"
+        assert node.data[15002][2] == "10.0.0.2"
+
+        # The node's own local copy of a new name is refused too.
+        await node.store(15005, "10.0.0.5")
+        assert 15005 not in node.data and len(node.data) == 3
+    finally:
+        server.close()
+        await server.wait_closed()

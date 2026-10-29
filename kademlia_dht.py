@@ -39,6 +39,11 @@ MAX_MESSAGE_SIZE = 1024 * 1024  # 1 MB
 # so every record a node accepts also fits in one MAX_MESSAGE_SIZE reply.
 MAX_VALUE_SIZE = 512 * 1024
 
+# Most records one node keeps. A STORE for a new name beyond this is
+# REJECTED; updates to names the node already holds still go through.
+# (Records don't expire, so without a cap anyone could fill a node's memory.)
+MAX_RECORDS = 10_000
+
 # Read timeout (seconds) for the header and body of a single framed message.
 # A client that declares a length and then stalls holds the handler forever
 # without this, so every framed read is wrapped in wait_for(READ_TIMEOUT).
@@ -587,6 +592,9 @@ class KademliaNode:
         """
         record = self.data.get(key)
         if record is None:
+            if len(self.data) >= MAX_RECORDS:
+                return False, (f"node is full ({MAX_RECORDS} records); not "
+                               f"taking new key {key}")
             self.data[key] = (owner, seq, value, signature)
             return True, f"Stored key-value pair: {key} {value}"
 
