@@ -1,19 +1,52 @@
+import argparse
 import asyncio
 import random
 import ipaddress
 import json
 import base64
 
+# Loopback by default, so a test run or demo isn't reachable from the
+# network. Pass --host 0.0.0.0 (or a LAN address) to accept remote peers.
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8888
+VIRTUAL_NETWORK = "10.0.0.0/8"
+
+
 class IntroductionServer:
-    def __init__(self):
+    def __init__(self, network: str = VIRTUAL_NETWORK):
         self.peers = {}
-        self.virtual_network = ipaddress.IPv4Network('10.0.0.0/8')
-        self.available_ips = set(self.virtual_network.hosts())
+        self.virtual_network = ipaddress.IPv4Network(network)
+        # Addresses are handed out lazily: a counter walks the host range in
+        # order, and released addresses are reused first. (Materializing
+        # set(network.hosts()) for a /8 is 16.7M objects, over 2 GB.) The
+        # host range matches hosts(): no network/broadcast address, except
+        # on /31 and /32 where every address is a host.
+        net = self.virtual_network
+        if net.num_addresses > 2:
+            self._first_ip = int(net.network_address) + 1
+            self._last_ip = int(net.broadcast_address) - 1
+        else:
+            self._first_ip = int(net.network_address)
+            self._last_ip = int(net.broadcast_address)
+        self._next_ip = self._first_ip
+        self.released_ips = set()
 
     def assign_virtual_ip(self):
-        if not self.available_ips:
+        if self.released_ips:
+            return str(ipaddress.IPv4Address(self.released_ips.pop()))
+        if self._next_ip > self._last_ip:
             raise Exception("No available IPs")
-        return str(self.available_ips.pop())
+        ip = ipaddress.IPv4Address(self._next_ip)
+        self._next_ip += 1
+        return str(ip)
+
+    def release_virtual_ip(self, virtual_ip: str):
+        """Return an assigned address to the pool and forget its peer."""
+        ip = int(ipaddress.IPv4Address(virtual_ip))
+        if not self._first_ip <= ip < self._next_ip or ip in self.released_ips:
+            raise ValueError(f"{virtual_ip} is not an assigned address")
+        self.peers.pop(virtual_ip, None)
+        self.released_ips.add(ip)
 
     def find_nearby_peers(self, public_ip, count=5):
         nearby_peers = random.sample(list(self.peers.items()), min(count, len(self.peers)))
@@ -74,9 +107,23 @@ class IntroductionServer:
         async with server:
             await server.serve_forever()
 
-async def main():
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="p2p-net introduction (bootstrap) server")
+    parser.add_argument(
+        "--host", default=DEFAULT_HOST,
+        help=f"address to listen on (default {DEFAULT_HOST}, local only; "
+             f"use 0.0.0.0 to accept peers from other machines)")
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT,
+        help=f"port to listen on (default {DEFAULT_PORT}; 0 picks a free port)")
+    return parser.parse_args(argv)
+
+
+async def main(argv=None):
+    args = parse_args(argv)
     intro_server = IntroductionServer()
-    await intro_server.start_server('0.0.0.0', 8888)
+    await intro_server.start_server(args.host, args.port)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
