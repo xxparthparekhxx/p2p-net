@@ -32,7 +32,7 @@ This protocol is designed to serve as the foundational layer for a distributed n
 Key Features:
 - **Decentralized Domain Name Resolution:** A P2P approach to DNS that ensures scalability and robustness.
 - **Direct Peer Communication:** Reduces network load by facilitating direct client-server interactions.
-- **NAT Traversal:** Advanced techniques for establishing connections across different network environments.
+- **NAT Traversal:** Planned — advanced techniques for establishing connections across different network environments are on the roadmap (see [NAT Traversal](#nat-traversal)).
 
 ## **Architecture Overview**
 
@@ -54,7 +54,7 @@ Kademlia operates by assigning unique identifiers (node IDs) to each peer and re
 
 ### **Introduction Server**
 
-The **Introduction Server** plays a pivotal role in enabling NAT traversal and initial peer discovery. Although the network is largely decentralized, the Introduction Server acts as a bootstrap node for new peers and assists in punching holes through NATs. It:
+The **Introduction Server** acts as a bootstrap node for new peers. NAT hole punching through it is planned but not yet implemented. It:
 - Stores information about peers temporarily.
 - Facilitates the initial connection setup between two peers.
 - Helps peers discover each other by providing a rendezvous point.
@@ -71,7 +71,7 @@ The protocol provides a decentralized domain name resolution system. The workflo
 
 Peer connections follow this process:
 1. **Peer Discovery:** Peers discover each other using the Kademlia DHT and Introduction Server.
-2. **Direct Communication:** Once discovered, peers establish a direct connection, bypassing the Introduction Server.
+2. **Direct Communication:** Planned — once discovered, peers are intended to establish a direct connection, bypassing the Introduction Server.
 
 ### **NAT Traversal**
 
@@ -97,9 +97,8 @@ NAT traversal is planned but not yet implemented. The Introduction Server exists
 
 ### **Security Considerations**
 
-Security is planned but not yet built:
-- **Encryption:** Planned — all communication between peers is intended to be encrypted using industry-standard cryptographic algorithms (currently the network key travels in plain text ahead of the message it encrypts).
-- **Authentication:** Planned — peers are intended to be authenticated using public key cryptography (currently records are not signed, so anyone can overwrite a name).
+- **Encryption:** Planned — all communication between peers is intended to be encrypted using industry-standard cryptographic algorithms. The introduction server no longer distributes a network key in plaintext; peers exchange only join metadata, and record authenticity relies on the signed records below.
+- **Authentication:** Implemented — STORE records are signed with the storing node's Ed25519 long-term key, and peers verify the signature before storing anything. Names are owned on first use: the first valid signed STORE for a name binds it to the signer's public key, later STOREs for that name signed by a different key are rejected, and FIND_VALUE returns the owner key with the value so lookups can verify it.
 - **Resilience:** Planned — the protocol is designed to handle malicious nodes by incorporating redundancy and cryptographic verification.
 
 ## **Future Work**
