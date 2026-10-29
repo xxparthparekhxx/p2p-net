@@ -2,6 +2,7 @@ import asyncio
 import random
 import json
 import base64
+from typing import Optional
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from kademlia_dht import KademliaNode, sha1_hash, Node
@@ -67,17 +68,24 @@ class P2PNode:
         domain_hash = sha1_hash(domain)
         print(f"Registering domain {domain} (hash: {domain_hash}) to IP {ip}")
         await self.kademlia.store(domain_hash, ip)
-        stored_value, _ = await self.kademlia.find_value(domain_hash)
+        # Only our own signed record counts as a successful registration.
+        stored_value, _ = await self.kademlia.find_value(
+            domain_hash, expected_owner=self.kademlia.owner_public_key
+        )
         if stored_value == ip:
             print(f"Registration of {domain} succeeded")
         else:
             print(f"Registration of {domain} failed. Expected {ip}, found {stored_value}")
         return stored_value == ip
 
-    async def lookup_domain(self, domain: str) -> str:
+    async def lookup_domain(self, domain: str,
+                            owner: Optional[bytes] = None) -> Optional[str]:
+        # Pass the owner's public key, when known, to accept only its records.
         domain_hash = sha1_hash(domain)
         print(f"Looking up domain {domain} (hash: {domain_hash})")
-        result, _ = await self.kademlia.find_value(domain_hash)
+        result, _ = await self.kademlia.find_value(
+            domain_hash, expected_owner=owner
+        )
         print(f"Lookup result for {domain}: {result}")
         return result
 

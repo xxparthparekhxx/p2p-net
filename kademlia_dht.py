@@ -3,7 +3,7 @@ import base64
 import json
 import hashlib
 import time
-from typing import List, Tuple, Dict, Optional, Union
+from typing import List, Tuple, Dict, NamedTuple, Optional, Union
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
@@ -31,9 +31,95 @@ READ_TIMEOUT = 10
 # value so an old signed STORE cannot be replayed to roll a record back.
 STORE_DOMAIN_SEPARATOR = b"p2p-net/STORE/v1\0"
 
+ED25519_PUBLIC_KEY_SIZE = 32
+ED25519_SIGNATURE_SIZE = 64
+
 
 def sha1_hash(data: str) -> int:
     return int(hashlib.sha1(data.encode()).hexdigest(), 16)
+
+
+def record_message(key: int, seq: int, value_bytes: bytes) -> bytes:
+    """The exact bytes an owner signs for a record: domain separator, then
+    key, seq and value separated by NUL (key and seq are decimal, so the
+    encoding is unambiguous with the value last)."""
+    return (
+        STORE_DOMAIN_SEPARATOR
+        + str(key).encode()
+        + b"\0"
+        + str(seq).encode()
+        + b"\0"
+        + value_bytes
+    )
+
+
+def verify_record(key: int, seq: int, value_bytes: bytes, owner: bytes,
+                  signature: bytes) -> bool:
+    """True if `signature` is `owner`'s Ed25519 signature over the record."""
+    try:
+        Ed25519PublicKey.from_public_bytes(owner).verify(
+            signature, record_message(key, seq, value_bytes)
+        )
+        return True
+    except (InvalidSignature, ValueError, TypeError):
+        return False
+
+
+class VerifiedRecord(NamedTuple):
+    value: str
+    seq: int
+    owner: bytes
+    signature: bytes
+
+
+def _is_int(x) -> bool:
+    # JSON true/false decode to bool, which is an int subclass in Python.
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _b64_field(reply: dict, name: str, size: int) -> bytes:
+    raw = reply[name]
+    if not isinstance(raw, str):
+        raise ValueError(f"{name} is not a base64 string")
+    try:
+        decoded = base64.b64decode(raw, validate=True)
+    except ValueError:
+        raise ValueError(f"{name} is not valid base64")
+    if len(decoded) != size:
+        raise ValueError(f"{name} is {len(decoded)} bytes, expected {size}")
+    return decoded
+
+
+def parse_record_reply(key: int, reply) -> VerifiedRecord:
+    """Check a FIND_VALUE record reply for `key` and return it verified.
+
+    The reply carries the whole signed record (key, seq, value, owner public
+    key, signature), so the signed message is rebuilt from it and checked
+    against the claimed owner. Raises ValueError if anything is missing,
+    malformed, for a different key, or the signature does not verify.
+    """
+    if not isinstance(reply, dict):
+        raise ValueError("reply is not a JSON object")
+    missing = [f for f in ("key", "seq", "value", "owner", "signature")
+               if f not in reply]
+    if missing:
+        raise ValueError(f"missing fields: {', '.join(missing)}")
+    reply_key, seq, value = reply["key"], reply["seq"], reply["value"]
+    if not _is_int(reply_key) or reply_key != key:
+        raise ValueError("record is for a different key")
+    if not _is_int(seq):
+        raise ValueError("seq is not an integer")
+    if not isinstance(value, str):
+        raise ValueError("value is not a string")
+    owner = _b64_field(reply, "owner", ED25519_PUBLIC_KEY_SIZE)
+    signature = _b64_field(reply, "signature", ED25519_SIGNATURE_SIZE)
+    try:
+        value_bytes = value.encode()
+    except UnicodeEncodeError:
+        raise ValueError("value is not valid text")
+    if not verify_record(reply_key, seq, value_bytes, owner, signature):
+        raise ValueError("signature does not verify for the claimed owner")
+    return VerifiedRecord(value, seq, owner, signature)
 
 
 class Node:
@@ -121,26 +207,21 @@ class KademliaProtocol:
     async def ping(self, writer):
         await self._send_message(writer, b"PING")
 
-    async def store(self, writer, key: int, value: str, seq: int = None):
+    async def store(self, writer, key: int, value: str, seq: int = None,
+                    signature: bytes = None):
         # Sign a domain-separated message covering key, sequence number and
         # value, with the value carried base64-encoded so values of any bytes
-        # (including spaces and the empty string) round-trip exactly.
-        signing_key = self.kademlia_node.signing_key
-        if seq is None:
-            seq = time.time_ns()
+        # (including spaces and the empty string) round-trip exactly. A caller
+        # that already signed the record (KademliaNode.store) passes the
+        # signature and its seq so every replica carries the same signature.
         value_bytes = value.encode() if isinstance(value, str) else value
-        message = (
-            STORE_DOMAIN_SEPARATOR
-            + str(key).encode()
-            + b"\0"
-            + str(seq).encode()
-            + b"\0"
-            + value_bytes
-        )
-        signature = signing_key.sign(message)
-        public_key_bytes = signing_key.public_key().public_bytes(
-            Encoding.Raw, PublicFormat.Raw
-        )
+        if signature is None:
+            if seq is None:
+                seq = time.time_ns()
+            signature = self.kademlia_node.sign_record(key, seq, value_bytes)
+        elif seq is None:
+            raise ValueError("a prebuilt signature needs the seq it signs")
+        public_key_bytes = self.kademlia_node.owner_public_key
 
         payload = (
             f"STOR {key} {seq} "
@@ -189,16 +270,8 @@ class KademliaProtocol:
             await self._send_message(writer, b"REJECTED")
             return
 
-        message = (
-            STORE_DOMAIN_SEPARATOR
-            + str(key).encode()
-            + b"\0"
-            + str(seq).encode()
-            + b"\0"
-            + value_bytes
-        )
         try:
-            public_key.verify(signature, message)
+            public_key.verify(signature, record_message(key, seq, value_bytes))
         except InvalidSignature:
             print(f"Rejecting STORE: bad signature for key {key}")
             await self._send_message(writer, b"REJECTED")
@@ -208,23 +281,24 @@ class KademliaProtocol:
         # name to the signer's public key. A later STORE signed by a different
         # key is rejected; the rightful owner can keep updating the record,
         # but only with a strictly greater sequence number (an equal seq with
-        # the identical value is an idempotent no-op).
+        # the identical value is an idempotent no-op). The signature is kept
+        # with the record so FIND_VALUE can hand out a self-verifying record.
         value = value_bytes.decode()
         record = self.kademlia_node.data.get(key)
         if record is None:
-            self.kademlia_node.data[key] = (public_key_bytes, seq, value)
+            self.kademlia_node.data[key] = (public_key_bytes, seq, value, signature)
             print(f"Stored key-value pair: {key} {value}")
             await self._send_message(writer, b"OK")
             return
 
-        owner_pubkey, stored_seq, stored_value = record
+        owner_pubkey, stored_seq, stored_value, _ = record
         if owner_pubkey != public_key_bytes:
             print(f"Rejecting STORE: key {key} is owned by a different key")
             await self._send_message(writer, b"REJECTED")
             return
 
         if seq > stored_seq:
-            self.kademlia_node.data[key] = (public_key_bytes, seq, value)
+            self.kademlia_node.data[key] = (public_key_bytes, seq, value, signature)
             print(f"Updated key-value pair: {key} {value}")
             await self._send_message(writer, b"OK")
             return
@@ -257,14 +331,16 @@ class KademliaProtocol:
         _, key_s = payload.decode().split()
         key = int(key_s)
         if key in self.kademlia_node.data:
-            # Return the owner public key and sequence number alongside the
-            # value so lookups can verify who owns the name and how fresh the
-            # record is.
-            owner, seq, value = self.kademlia_node.data[key]
+            # Return the whole signed record (key, seq, value, owner public
+            # key and signature) so the caller can verify it on its own; this
+            # node is not trusted to vouch for it.
+            owner, seq, value, signature = self.kademlia_node.data[key]
             response = json.dumps({
+                'key': key,
                 'value': value,
                 'seq': seq,
                 'owner': base64.b64encode(owner).decode(),
+                'signature': base64.b64encode(signature).decode(),
             })
         else:
             closest_nodes = self.kademlia_node.routing_table.find_closest(key)
@@ -281,11 +357,13 @@ class KademliaNode:
         self.ip = ip
         self.port = port
         self.routing_table = RoutingTable(id)
-        # Maps key -> (owner public key bytes, seq, value). The owner key is
-        # the Ed25519 public key of whoever first stored the name on this node
-        # (see KademliaProtocol.handle_store). seq is a uint64 written when the
-        # owner calls store(); it survives restarts because no state is saved.
-        self.data: Dict[int, Tuple[bytes, int, str]] = {}
+        # Maps key -> (owner public key bytes, seq, value, signature). The
+        # owner key is the Ed25519 public key of whoever first stored the name
+        # on this node (see KademliaProtocol.handle_store). seq is a uint64
+        # written when the owner calls store(); it survives restarts because
+        # no state is saved. The signature is the owner's signature over
+        # record_message(key, seq, value), so any copy can be re-verified.
+        self.data: Dict[int, Tuple[bytes, int, str, bytes]] = {}
         # Long-term signing key used to sign records this node stores.
         self.signing_key = Ed25519PrivateKey.generate()
         # This node's own public key, the owner recorded for names it stores.
@@ -293,6 +371,9 @@ class KademliaNode:
             Encoding.Raw, PublicFormat.Raw
         )
         self.protocol = KademliaProtocol(id, self)
+
+    def sign_record(self, key: int, seq: int, value_bytes: bytes) -> bytes:
+        return self.signing_key.sign(record_message(key, seq, value_bytes))
 
     async def bootstrap(self, bootstrap_nodes: List[Node]):
         for node in bootstrap_nodes:
@@ -312,10 +393,11 @@ class KademliaNode:
             print(f"Failed to ping node {node.id} : Tried Pinging {node.ip}:{node.port} : {e}")
 
     async def store(self, key: int, value: str):
-        # One seq for this store op, carried unchanged to the local copy and
-        # every replica so the record's signature and seq stay identical
-        # wherever it is stored.
+        # One seq and one signature for this store op, carried unchanged to
+        # the local copy and every replica so the record is identical (and
+        # verifiable) wherever it is stored.
         seq = time.time_ns()
+        signature = self.sign_record(key, seq, value.encode())
         nodes = self.routing_table.find_closest(key)
         store_tasks = []
         for node in nodes:
@@ -326,15 +408,18 @@ class KademliaNode:
                 if record is not None and record[0] != self.owner_public_key:
                     print(f"Refusing to store key {key}: owned by a different key")
                     continue
-                self.data[key] = (self.owner_public_key, seq, value)
+                self.data[key] = (self.owner_public_key, seq, value, signature)
             else:
-                store_tasks.append(self._store_on_node(node, key, value, seq))
+                store_tasks.append(
+                    self._store_on_node(node, key, value, seq, signature)
+                )
         await asyncio.gather(*store_tasks)
 
-    async def _store_on_node(self, node: Node, key: int, value: str, seq: int):
+    async def _store_on_node(self, node: Node, key: int, value: str, seq: int,
+                             signature: bytes = None):
         try:
             reader, writer = await asyncio.open_connection(node.ip, node.port)
-            await self.protocol.store(writer, key, value, seq)
+            await self.protocol.store(writer, key, value, seq, signature)
             response = await self.protocol._read_message(reader)
             if response == b"OK":
                 print(f"Successfully stored value {value} on node {node.id}")
@@ -376,59 +461,92 @@ class KademliaNode:
             print(f"Failed to find_node on {node.id}: {e}")
             return []
 
-    async def find_value(self, key: int) -> Tuple[Optional[str], List[Node]]:
+    async def find_value(
+        self, key: int, expected_owner: Optional[bytes] = None
+    ) -> Tuple[Optional[str], List[Node]]:
+        """Look up `key` and return (value, []) or (None, closest nodes).
+
+        Every candidate record, the local copy included, must carry a valid
+        owner signature; replies that fail verification count as no answer.
+        The lookup walks the K closest nodes instead of stopping at the first
+        hit, and the verified record with the highest seq wins, so a node
+        serving an older (but genuinely signed) record loses to any fresher
+        replica it reaches. With `expected_owner` set, only records signed by
+        that public key are accepted.
+        """
         print(f"find_value  for key {key} on node {self.id} {self.data} ")
 
-        if key in self.data:
-            owner, value = self.data[key]
-            return value, []
+        candidates: List[VerifiedRecord] = []
+        local = self.data.get(key)
+        if local is not None:
+            owner, seq, value, signature = local
+            if not (isinstance(value, str)
+                    and verify_record(key, seq, value.encode(), owner, signature)):
+                print(f"Ignoring local record for key {key}: signature does not verify")
+            elif expected_owner is not None and owner != expected_owner:
+                print(f"Ignoring local record for key {key}: not the expected owner")
+            else:
+                candidates.append(VerifiedRecord(value, seq, owner, signature))
+
         nodes = self.routing_table.find_closest(key)
-        if not nodes:
-            return None, []
         queried_nodes = set()
         while True:
             unqueried = [node for node in nodes if node not in queried_nodes][:ALPHA]
             if not unqueried:
                 break
-            query_tasks = [self._find_value_on_node(node, key) for node in unqueried]
+            query_tasks = [
+                self._find_value_on_node(node, key, expected_owner)
+                for node in unqueried
+            ]
             results = await asyncio.gather(*query_tasks)
             for result in results:
-                if isinstance(result, tuple):
-                    # (value, owner) hit; the owner key is available for
-                    # verification but the lookup itself returns the value.
-                    return result[0], []
+                if isinstance(result, VerifiedRecord):
+                    candidates.append(result)
                 elif result:
                     nodes.extend(result)
             queried_nodes.update(unqueried)
             nodes = sorted(set(nodes), key=lambda n: n.id ^ key)[:K]
+
+        if candidates:
+            if len({c.owner for c in candidates}) > 1:
+                print(f"Warning: key {key} has verified records from more than "
+                      f"one owner; pass expected_owner to pin the owner")
+            best = max(candidates, key=lambda c: c.seq)
+            return best.value, []
         return None, nodes
 
     async def _find_value_on_node(
-        self, node: Node, key: int
-    ) -> Union[Tuple[str, Optional[bytes]], List[Node], None]:
+        self, node: Node, key: int, expected_owner: Optional[bytes] = None
+    ) -> Union[VerifiedRecord, List[Node], None]:
         try:
             reader, writer = await asyncio.open_connection(node.ip, node.port)
-            await self.protocol.find_value(writer, key)
-            response = await self.protocol._read_message(reader)
-            writer.close()
-            await writer.wait_closed()
-
             try:
-                result = json.loads(response.decode())
-                if 'value' in result:
-                    # The owner public key (base64) accompanies stored values.
-                    owner = (
-                        base64.b64decode(result['owner'])
-                        if result.get('owner') else None
-                    )
-                    return result['value'], owner
-                elif 'nodes' in result:
-                    return [Node(n['id'], n['ip'], n['port']) for n in result['nodes']]
-            except json.JSONDecodeError:
-                print(f"Failed to decode JSON from node {node.id}: {response}")
-                return None
+                await self.protocol.find_value(writer, key)
+                response = await self.protocol._read_message(reader)
+            finally:
+                writer.close()
+                await writer.wait_closed()
         except Exception as e:
             print(f"Failed to find_value on {node.id}: {e}")
+            return None
+
+        # The reply is untrusted. A record must verify against the owner key
+        # it claims (and match expected_owner if given); anything that can't
+        # be parsed or verified counts as no answer from this node. The broad
+        # except also covers RecursionError from deeply nested JSON.
+        try:
+            result = json.loads(response.decode())
+            if isinstance(result, dict) and 'value' in result:
+                record = parse_record_reply(key, result)
+                if expected_owner is not None and record.owner != expected_owner:
+                    raise ValueError("record is signed by a different owner "
+                                     "than expected")
+                return record
+            if isinstance(result, dict) and 'nodes' in result:
+                return [Node(n['id'], n['ip'], n['port']) for n in result['nodes']]
+            raise ValueError("reply has neither a record nor a node list")
+        except Exception as e:
+            print(f"Rejecting FIND_VALUE reply from node {node.id}: {e}")
             return None
 
     async def listen(self):
