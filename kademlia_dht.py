@@ -48,6 +48,11 @@ CONNECT_TIMEOUT = 5
 # value so an old signed STORE cannot be replayed to roll a record back.
 STORE_DOMAIN_SEPARATOR = b"p2p-net/STORE/v1\0"
 
+# seq is an unsigned 64-bit integer: 0 <= seq < SEQ_LIMIT. Anything outside
+# that is refused on STORE and in FIND_VALUE replies (Python ints are
+# unbounded, so without the check a peer could sign seq = 10**100).
+SEQ_LIMIT = 2 ** 64
+
 ED25519_PUBLIC_KEY_SIZE = 32
 ED25519_SIGNATURE_SIZE = 64
 
@@ -208,6 +213,11 @@ def _is_int(x) -> bool:
     return isinstance(x, int) and not isinstance(x, bool)
 
 
+def valid_seq(seq) -> bool:
+    """True if `seq` is an unsigned 64-bit integer (not a bool)."""
+    return _is_int(seq) and 0 <= seq < SEQ_LIMIT
+
+
 def _b64_field(reply: dict, name: str, size: int) -> bytes:
     raw = reply[name]
     if not isinstance(raw, str):
@@ -238,8 +248,8 @@ def parse_record_reply(key: int, reply) -> VerifiedRecord:
     reply_key, seq, value = reply["key"], reply["seq"], reply["value"]
     if not _is_int(reply_key) or reply_key != key:
         raise ValueError("record is for a different key")
-    if not _is_int(seq):
-        raise ValueError("seq is not an integer")
+    if not valid_seq(seq):
+        raise ValueError("seq is not an unsigned 64-bit integer")
     if not isinstance(value, str):
         raise ValueError("value is not a string")
     owner = _b64_field(reply, "owner", ED25519_PUBLIC_KEY_SIZE)
@@ -418,6 +428,12 @@ class KademliaProtocol:
             signature = base64.b64decode(signature_b64)
         except Exception:
             print("Rejecting malformed STORE: missing or invalid fields")
+            await self._send_message(writer, b"REJECTED")
+            return
+
+        if not valid_seq(seq):
+            print(f"Rejecting STORE: seq for key {key} is not an unsigned "
+                  f"64-bit integer")
             await self._send_message(writer, b"REJECTED")
             return
 
@@ -672,7 +688,7 @@ class KademliaNode:
         local = self.data.get(key)
         if local is not None:
             owner, seq, value, signature = local
-            if not (isinstance(value, str)
+            if not (isinstance(value, str) and valid_seq(seq)
                     and verify_record(key, seq, value.encode(), owner, signature)):
                 print(f"Ignoring local record for key {key}: signature does not verify")
             elif expected_owner is not None and owner != expected_owner:

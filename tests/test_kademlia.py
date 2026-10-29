@@ -19,6 +19,7 @@ from kademlia_dht import (
     K,
     RoutingTable,
     CONNECT_TIMEOUT,
+    SEQ_LIMIT,
     ID_BITS,
     MAX_LOOKUP_QUERIES,
     MAX_MESSAGE_SIZE,
@@ -1111,3 +1112,51 @@ async def test_local_copy_follows_the_ownership_rule():
     assert node.put_record(key, pub(other), seq, "10.0.0.1", signature)[0]
     await node.store(key, "6.6.6.6")
     assert node.data[key][:3] == (pub(other), seq, "10.0.0.1")
+
+
+# --- seq range ---
+
+
+@pytest.mark.asyncio
+async def test_store_rejects_seq_outside_uint64():
+    """Correctly signed STOREs with seq = 2**64 or seq = -1 are REJECTED;
+    the largest uint64 is accepted."""
+    assert SEQ_LIMIT == 2 ** 64
+    node = make_node(1)
+    server = await start_node(node)
+    owner = Ed25519PrivateKey.generate()
+    key = 13000
+    try:
+        for bad_seq in (2 ** 64, -1, 2 ** 200):
+            payload, _ = make_store_payload(owner, key, "6.6.6.6", seq=bad_seq)
+            assert await rpc(node.port, payload) == b"REJECTED", bad_seq
+            assert node.data == {}
+        payload, _ = make_store_payload(owner, key, "10.0.0.1", seq=2 ** 64 - 1)
+        assert await rpc(node.port, payload) == b"OK"
+        payload, _ = make_store_payload(owner, key + 1, "10.0.0.1", seq=0)
+        assert await rpc(node.port, payload) == b"OK"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_reply_with_seq_outside_uint64_is_rejected():
+    """A FIND_VALUE reply validly signed over seq = 2**64 or seq = -1 is not
+    accepted as a record, so it can't outrank every honest seq."""
+    key = 13100
+    owner = Ed25519PrivateKey.generate()
+    client = make_node(7)
+    servers = []
+    try:
+        for bad_seq in (2 ** 64, -1):
+            reply = signed_reply(owner, key, bad_seq, "6.6.6.6")
+            with pytest.raises(ValueError, match="64-bit"):
+                parse_record_reply(key, reply)
+            server, port = await start_reply_server(json.dumps(reply).encode())
+            servers.append(server)
+            assert await client._find_value_on_node(Node(80, IP, port), key) is None
+        top = signed_reply(owner, key, 2 ** 64 - 1, "10.0.0.1")
+        assert parse_record_reply(key, top).seq == 2 ** 64 - 1
+    finally:
+        await close_all(servers)
