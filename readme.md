@@ -98,9 +98,9 @@ NAT traversal is planned but not yet implemented. The Introduction Server exists
 ### **Security Considerations**
 
 - **Encryption:** Planned — all communication between peers is intended to be encrypted using industry-standard cryptographic algorithms. The introduction server no longer distributes a network key in plaintext; peers exchange only join metadata, and record authenticity relies on the signed records below.
-- **Authentication:** Implemented — STORE records are signed with the storing
-  node's Ed25519 long-term key, and peers verify the signature before storing
-  anything. A STORE record is exactly five space-separated tokens:
+- **Authentication:** Implemented. STORE records are signed with the
+  storing node's Ed25519 long-term key, and peers verify the signature before
+  storing anything. A STORE record is exactly five space-separated tokens:
 
   `STOR <key> <seq> <base64 value> <base64 owner public key> <base64 signature>`
 
@@ -110,29 +110,75 @@ NAT traversal is planned but not yet implemented. The Introduction Server exists
 
   `p2p-net/STORE/v1\0<key>\0<seq>\0<value_bytes>`
 
-  where `<seq>` is an unsigned 64-bit sequence number (`time.time_ns()`)
-  written by the owner when it calls store(). Values must be UTF-8 text. A
-  node stores `(owner public key, seq, value, signature)` per name. Names are
-  owned on trust-on-first-use per node:
-  the first valid signed STORE for a name on a node that has never seen it
-  binds it to the signer's public key there. A later STORE for that name is
-  accepted only from the same owner and only with a strictly greater seq
-  (an equal seq with the identical value is an idempotent no-op); anything
-  else is rejected with REJECTED. This prevents replaying an old signed STORE
-  to roll a record back. Records are self-verifying: FIND_VALUE returns the
-  whole signed record (key, seq, value, owner key and signature), and a
-  lookup re-checks the signature on every reply, ignores any that fail and
-  returns the verified record with the highest seq (pass `expected_owner` to
-  accept only one owner's key). A node can refuse to answer or serve an older
-  signed copy, but it cannot forge a record under someone else's key. There
-  is no global registry: ownership is independent on each node,
-  whoever stores a name first on that node becomes its owner there. Replication
-  carries the original owner's signature and seq unchanged; a node never
-  re-signs someone else's record with its own key. Because names are bound to
-  that key, a node keeps its Ed25519 signing key across restarts in
+  where `<seq>` is the owner's sequence number (`time.time_ns()` when it calls
+  store()). seq must be an unsigned 64-bit integer (`0 <= seq < 2**64`); a
+  STORE or a FIND_VALUE reply outside that range is rejected. Values must be
+  UTF-8 text. A node stores `(owner public key, seq, value, signature)` per
+  name, including a local copy of the names it stores itself when it is
+  among the K closest nodes to the key.
+- **Ownership:** trust-on-first-use, per node. The first valid signed STORE
+  for a name on a node that has never seen it binds the name to the signer's
+  public key there. A later STORE for that name is accepted only from the
+  same owner and only with a strictly greater seq (an equal seq with the
+  identical value is an idempotent no-op); anything else gets REJECTED. This
+  prevents replaying an old signed STORE to roll a record back. There is no
+  global registry: whoever stores a name first on a node owns it there.
+  Replication carries the original owner's signature and seq unchanged; a
+  node never re-signs someone else's record with its own key.
+- **Read policy:** records are self-verifying. FIND_VALUE returns the whole
+  signed record as JSON (`key`, `seq`, base64 `value`, base64 `owner`, base64
+  `signature`), and a lookup re-checks the signature on every reply (and on
+  the local copy), ignoring any that fail. A lookup queries the K closest
+  nodes rather than stopping at the first answer, then:
+  1. **Unpinned (first lookup of a name):** verified records are grouped by
+     owner, and the owner served by the most distinct replicas wins. Replicas
+     are counted by ip:port, so one endpoint reached under several contact
+     ids counts once; the local copy counts as one. Within that owner, the
+     highest seq wins. Ties are broken deterministically (lowest owner key),
+     and a warning is logged whenever more than one owner is seen. A single
+     malicious node serving its own record at seq `2**64-1` therefore loses
+     to the owner that the honest replicas agree on.
+  2. **Pinned (every later lookup):** `P2PNode.lookup_domain` pins the
+     owner's public key the first time a name resolves, and from then on
+     accepts only that owner's records (highest seq wins). Pins are saved
+     next to the key file, named after it with an `.owners.json` extension
+     (`node_9000.key` -> `node_9000.owners.json`; mode 0600, written
+     crash-safely), so they survive restarts. `forget_owner(domain)` drops a
+     pin; pass `owner=` to `lookup_domain` (or `expected_owner=` to
+     `KademliaNode.find_value`) to pin a known key yourself.
+
+  A node can refuse to answer or serve an older signed copy, but it cannot
+  forge a record under someone else's key.
+- **Keys:** a node keeps its Ed25519 signing key across restarts in
   `~/.p2p-net/node_<port>.key` (override with the `key_path` argument or the
-  `P2P_NET_KEY_DIR` directory). The file is created with mode 0600; a node
-  that loses it can no longer update the names it registered.
+  `P2P_NET_KEY_DIR` directory). A node on port 0 has no default key file (the
+  port changes on every bind) and must be given `key_path`. New key files
+  are written to a 0600 temp file in the same directory, fsynced and renamed
+  into place, so a crash never leaves a torn key behind. A node that loses
+  its key can no longer update the names it registered.
+- **Limits and timeouts** (module constants in `kademlia_dht.py`):
+
+  | Constant | Value | Effect |
+  | --- | --- | --- |
+  | `MAX_MESSAGE_SIZE` | 1 MB | Largest framed message accepted (4-byte length prefix). |
+  | `MAX_VALUE_SIZE` | 512 KB | Largest STORE value (UTF-8 bytes); bigger ones are REJECTED. Replies carry the value base64-encoded, so every stored record fits in one reply. |
+  | `MAX_RECORDS` | 10,000 | Records per node. A STORE for a new name past the cap is REJECTED; updates to stored names still work. |
+  | `CONNECT_TIMEOUT` | 5 s | Every outgoing TCP connect; an unreachable contact can't stall a lookup round. |
+  | `READ_TIMEOUT` | 10 s | Header and body of each framed message. |
+  | `MAX_LOOKUP_QUERIES` | 4 × K = 80 | Most nodes one lookup queries. |
+
+  Values and other peer-supplied text are logged with `repr()` and truncated,
+  so escape sequences in a value never reach the operator's terminal.
+- **Known limits:**
+  - Contacts in FIND_NODE / FIND_VALUE replies are not authenticated: a node
+    can claim any id and point at any address. A Sybil attacker that controls
+    most of the K closest nodes for a name (distinct ip:port endpoints) can
+    still win a node's first, unpinned lookup of that name, and that node
+    then pins the attacker's key.
+  - Records never expire. They live in memory until the node restarts, and
+    a node that reaches `MAX_RECORDS` refuses new names until then. Record
+    expiry and republishing are not built.
+  - Ownership is per node (trust-on-first-use), not global; see above.
 - **Resilience:** Planned — the protocol is designed to handle malicious nodes by incorporating redundancy and cryptographic verification.
 
 ## **Future Work**
@@ -157,17 +203,32 @@ pip install -r requirements.txt
 
 ### **Usage**
 
-To start a Introduction server:
+To start the introduction server:
 
 ```bash
 python introduction_server.py
 ```
 
-To start a Node (currently it is initalizing 10 nodes and connecting each other and registering 2 domians and it checks if it is able to retirve the vIP address of the node):
+It listens on `127.0.0.1:8888` by default, so it is reachable only from the
+same machine. To accept peers from other machines, bind another address
+explicitly, e.g. `python introduction_server.py --host 0.0.0.0`; `--port`
+changes the port (`0` picks a free one).
+
+To run the demo (with the introduction server running): it starts 10 nodes
+on `127.0.0.1:9000-9009`, joins them through the introduction server at
+`127.0.0.1:8888`, registers two domains and looks them up from another node.
 
 ```bash
 python p2p_node.py
 ```
+
+Node keys (and owner pins) go to `~/.p2p-net`; set `P2P_NET_KEY_DIR` to keep
+them elsewhere, e.g. `P2P_NET_KEY_DIR=$(mktemp -d) python p2p_node.py`. If
+the introduction server isn't reachable, `join_network` raises
+`IntroductionServerUnreachable` and the demo prints the error and exits.
+
+Run the tests with `python -m pytest` (they keep all key files in temporary
+directories).
 
 ## **Contributing**
 
