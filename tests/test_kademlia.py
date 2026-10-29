@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import itertools
 import json
 import os
 import stat
@@ -30,12 +31,16 @@ from kademlia_dht import (
 IP = "127.0.0.1"
 
 
-@pytest.fixture(autouse=True)
-def isolated_key_dir(tmp_path, monkeypatch):
-    """Nodes persist their signing key; keep every key file (and any ~
-    expansion) inside this test's tmp_path, never the real home dir."""
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("P2P_NET_KEY_DIR", str(tmp_path / "keys"))
+# HOME and P2P_NET_KEY_DIR point into tmp_path (autouse fixture in conftest).
+_key_files = itertools.count()
+
+
+def make_node(node_id, ip=IP):
+    """A port-0 KademliaNode with a key file of its own under
+    $P2P_NET_KEY_DIR (port 0 has no default key path)."""
+    key_dir = os.environ["P2P_NET_KEY_DIR"]
+    path = os.path.join(key_dir, f"test_node_{next(_key_files)}.key")
+    return KademliaNode(node_id, ip, 0, key_path=path)
 
 
 async def start_node(node):
@@ -49,8 +54,8 @@ async def start_node(node):
 @pytest.mark.asyncio
 async def test_find_node_works():
     """FIND_NODE reaches a peer and returns it from its routing table."""
-    node_a = KademliaNode(1, IP, 0)
-    node_b = KademliaNode(2, IP, 0)
+    node_a = make_node(1)
+    node_b = make_node(2)
     server_a = await start_node(node_a)
     server_b = await start_node(node_b)
     try:
@@ -68,7 +73,7 @@ async def test_find_node_works():
 async def test_find_node_returns_twenty_nodes():
     """A full 20-node reply over the wire parses into Node objects."""
     target = 12345
-    node_b = KademliaNode(999, IP, 0)
+    node_b = make_node(999)
     server_b = await start_node(node_b)
     try:
         # 25 peers known to node_b; a FIND_NODE reply should cap at K=20.
@@ -76,7 +81,7 @@ async def test_find_node_returns_twenty_nodes():
         for peer in peers:
             node_b.routing_table.add(peer)
 
-        node_a = KademliaNode(1, IP, 0)
+        node_a = make_node(1)
         node_a.routing_table.add(Node(node_b.id, node_b.ip, node_b.port))
 
         result = await node_a.find_node(target)
@@ -94,14 +99,14 @@ async def test_find_node_returns_twenty_nodes():
 async def test_find_node_is_length_prefixed():
     """The largest reply (20 nodes) is read fully, not truncated."""
     target = 99999
-    node_b = KademliaNode(998, IP, 0)
+    node_b = make_node(998)
     server_b = await start_node(node_b)
     try:
         peers = [Node(i, IP, 20000 + i) for i in range(20)]
         for peer in peers:
             node_b.routing_table.add(peer)
 
-        node_a = KademliaNode(1, IP, 0)
+        node_a = make_node(1)
         node_a.routing_table.add(Node(node_b.id, node_b.ip, node_b.port))
 
         result = await node_a.find_node(target)
@@ -201,7 +206,7 @@ async def rpc(port, payload):
 @pytest.mark.asyncio
 async def test_store_binds_name_to_first_signer():
     """TOFU ownership: first signed STORE wins, other keys are rejected."""
-    node = KademliaNode(1, IP, 0)
+    node = make_node(1)
     server = await start_node(node)
     owner = Ed25519PrivateKey.generate()
     attacker = Ed25519PrivateKey.generate()
@@ -256,7 +261,7 @@ async def test_store_binds_name_to_first_signer():
 @pytest.mark.asyncio
 async def test_find_value_returns_owner_key():
     """FIND_VALUE replies with the owner public key and seq next to the value."""
-    node = KademliaNode(1, IP, 0)
+    node = make_node(1)
     server = await start_node(node)
     owner = Ed25519PrivateKey.generate()
     key = 54321
@@ -277,7 +282,7 @@ async def test_find_value_returns_owner_key():
 @pytest.mark.asyncio
 async def test_store_accepts_values_with_spaces():
     """Regression: values with spaces ("hello world") are stored verbatim."""
-    node = KademliaNode(1, IP, 0)
+    node = make_node(1)
     server = await start_node(node)
     owner = Ed25519PrivateKey.generate()
     key = 777
@@ -301,7 +306,7 @@ async def test_store_accepts_values_with_spaces():
 @pytest.mark.asyncio
 async def test_store_values_round_trip_exactly():
     """Values of any bytes, including leading/trailing spaces and "", round-trip."""
-    node = KademliaNode(1, IP, 0)
+    node = make_node(1)
     server = await start_node(node)
     owner = Ed25519PrivateKey.generate()
     key = 31337
@@ -320,7 +325,7 @@ async def test_store_values_round_trip_exactly():
 @pytest.mark.asyncio
 async def test_oversize_length_prefix_closes_connection():
     """A length prefix over the 1 MB cap is rejected, not allocated."""
-    node = KademliaNode(1, IP, 0)
+    node = make_node(1)
     server = await start_node(node)
     try:
         reader, writer = await asyncio.open_connection(IP, node.port)
@@ -341,8 +346,8 @@ async def test_oversize_length_prefix_closes_connection():
 async def test_replicated_record_keeps_original_owner_and_seq():
     """A record replicated from node A to node B keeps the original owner and
     seq, and an attacker cannot take over the name on B."""
-    node_a = KademliaNode(1, IP, 0)
-    node_b = KademliaNode(2, IP, 0)
+    node_a = make_node(1)
+    node_b = make_node(2)
     server_b = await start_node(node_b)
     attacker = Ed25519PrivateKey.generate()
     key = 4242
@@ -378,7 +383,7 @@ async def test_replicated_record_keeps_original_owner_and_seq():
 async def test_short_public_key_is_rejected_not_dropped():
     """A valid-base64 public key that isn't 32 bytes gets REJECTED, and the
     connection stays open instead of being dropped without a reply."""
-    node = KademliaNode(1, IP, 0)
+    node = make_node(1)
     server = await start_node(node)
     owner = Ed25519PrivateKey.generate()
     key = 9090
@@ -426,7 +431,7 @@ async def test_read_timeout_disconnects_stalling_client():
 
     old_timeout = kademlia_dht.READ_TIMEOUT
     kademlia_dht.READ_TIMEOUT = 0.5
-    node = KademliaNode(1, IP, 0)
+    node = make_node(1)
     server = await start_node(node)
     try:
         reader, writer = await asyncio.open_connection(IP, node.port)
@@ -496,8 +501,8 @@ async def close_all(servers):
 async def test_store_keeps_one_signature_for_local_copy_and_replicas():
     """KademliaNode.store signs once; the local copy and the replica keep that
     same signature, and FIND_VALUE returns it as a verifiable record."""
-    node_a = KademliaNode(1, IP, 0)
-    node_b = KademliaNode(2, IP, 0)
+    node_a = make_node(1)
+    node_b = make_node(2)
     server_a = await start_node(node_a)
     server_b = await start_node(node_b)
     key = 5150
@@ -531,8 +536,8 @@ async def test_tampered_record_is_rejected_and_honest_copy_wins():
     honest node."""
     key = 1000
     owner = Ed25519PrivateKey.generate()
-    honest = KademliaNode(1003, IP, 0)
-    tampered = KademliaNode(1001, IP, 0)  # closer to the key than honest
+    honest = make_node(1003)
+    tampered = make_node(1001)  # closer to the key than honest
     servers = [await start_node(honest), await start_node(tampered)]
     try:
         payload, seq = make_store_payload(owner, key, "10.0.0.1")
@@ -544,7 +549,7 @@ async def test_tampered_record_is_rejected_and_honest_copy_wins():
         tampered_contact = Node(tampered.id, IP, tampered.port)
         honest_contact = Node(honest.id, IP, honest.port)
 
-        client = KademliaNode(7, IP, 0)
+        client = make_node(7)
         assert await client._find_value_on_node(tampered_contact, key) is None
 
         # Only the tampered node known: no answer, not the forged value.
@@ -553,7 +558,7 @@ async def test_tampered_record_is_rejected_and_honest_copy_wins():
         assert value is None
 
         # Tampered and honest node known: the genuine value is returned.
-        client = KademliaNode(7, IP, 0)
+        client = make_node(7)
         client.routing_table.add(tampered_contact)
         client.routing_table.add(honest_contact)
         value, _ = await client.find_value(key)
@@ -583,7 +588,7 @@ async def test_find_value_reply_with_forged_owner_is_rejected():
     ]
     servers = []
     try:
-        client = KademliaNode(7, IP, 0)
+        client = make_node(7)
         for reply in forged:
             server, port = await start_reply_server(json.dumps(reply).encode())
             servers.append(server)
@@ -604,7 +609,7 @@ async def test_find_value_reply_with_forged_owner_is_rejected():
         genuine = signed_reply(owner, key, seq, "10.0.0.1")
         server, port = await start_reply_server(json.dumps(genuine).encode())
         servers.append(server)
-        client = KademliaNode(7, IP, 0)
+        client = make_node(7)
         for i, srv in enumerate(servers):
             client.routing_table.add(Node(60 + i, IP, srv.sockets[0].getsockname()[1]))
         value, _ = await client.find_value(key, expected_owner=pub(owner))
@@ -643,7 +648,7 @@ async def test_unverifiable_replies_count_as_no_answer():
     ]
     servers = []
     try:
-        client = KademliaNode(7, IP, 0)
+        client = make_node(7)
         for reply in bad_replies:
             server, port = await start_reply_server(reply)
             servers.append(server)
@@ -657,7 +662,7 @@ async def test_unverifiable_replies_count_as_no_answer():
                                         base64.b64decode(good['signature']))
 
         # A lookup that hits every bad peer still returns the good record.
-        client = KademliaNode(7, IP, 0)
+        client = make_node(7)
         for i, srv in enumerate(servers):
             client.routing_table.add(Node(100 + i, IP, srv.sockets[0].getsockname()[1]))
         value, _ = await client.find_value(key)
@@ -677,13 +682,13 @@ async def test_find_value_returns_highest_seq():
     assert seq2 > seq1
 
     for old_id, new_id in [(4001, 4100), (4100, 4001)]:
-        stale = KademliaNode(old_id, IP, 0)
-        fresh = KademliaNode(new_id, IP, 0)
+        stale = make_node(old_id)
+        fresh = make_node(new_id)
         servers = [await start_node(stale), await start_node(fresh)]
         try:
             assert await rpc(stale.port, old_payload) == b"OK"
             assert await rpc(fresh.port, new_payload) == b"OK"
-            client = KademliaNode(7, IP, 0)
+            client = make_node(7)
             client.routing_table.add(Node(stale.id, IP, stale.port))
             client.routing_table.add(Node(fresh.id, IP, fresh.port))
             value, _ = await client.find_value(key)
@@ -700,15 +705,15 @@ async def test_find_value_keeps_searching_after_a_stale_hit():
     owner = Ed25519PrivateKey.generate()
     old_payload, _ = make_store_payload(owner, key, "10.0.0.1")
     new_payload, _ = make_store_payload(owner, key, "10.0.0.2")
-    stale = KademliaNode(5001, IP, 0)
-    relay = KademliaNode(5002, IP, 0)   # holds nothing, knows the fresh node
-    fresh = KademliaNode(5003, IP, 0)
+    stale = make_node(5001)
+    relay = make_node(5002)   # holds nothing, knows the fresh node
+    fresh = make_node(5003)
     servers = [await start_node(n) for n in (stale, relay, fresh)]
     try:
         assert await rpc(stale.port, old_payload) == b"OK"
         assert await rpc(fresh.port, new_payload) == b"OK"
         relay.routing_table.add(Node(fresh.id, IP, fresh.port))
-        client = KademliaNode(7, IP, 0)
+        client = make_node(7)
         client.routing_table.add(Node(stale.id, IP, stale.port))
         client.routing_table.add(Node(relay.id, IP, relay.port))
         value, _ = await client.find_value(key)
@@ -721,7 +726,7 @@ async def test_find_value_keeps_searching_after_a_stale_hit():
 async def test_non_utf8_value_is_rejected_and_server_keeps_serving():
     """A correctly signed STORE whose value isn't UTF-8 gets REJECTED instead
     of dropping the connection, and the node keeps serving."""
-    node = KademliaNode(1, IP, 0)
+    node = make_node(1)
     server = await start_node(node)
     owner = Ed25519PrivateKey.generate()
     key = 6000
@@ -748,7 +753,7 @@ async def test_malformed_find_requests_get_an_empty_reply():
     old_handler = loop.get_exception_handler()
     loop.set_exception_handler(lambda _loop, ctx: unhandled.append(ctx))
 
-    node = KademliaNode(1, IP, 0)
+    node = make_node(1)
     server = await start_node(node)
     owner = Ed25519PrivateKey.generate()
     key = 7000
@@ -791,7 +796,7 @@ async def test_bad_node_lists_in_lookup_replies_are_ignored():
         ["not a node"],
         "not a list",
     ]
-    honest = KademliaNode(8001, IP, 0)
+    honest = make_node(8001)
     servers = [await start_node(honest)]
     try:
         assert await rpc(honest.port, make_store_payload(owner, key, "10.0.0.1")[0]) == b"OK"
@@ -799,7 +804,7 @@ async def test_bad_node_lists_in_lookup_replies_are_ignored():
             for request_reply in ({'nodes': nodes}, nodes):
                 server, port = await start_reply_server(json.dumps(request_reply).encode())
                 servers.append(server)
-        client = KademliaNode(7, IP, 0)
+        client = make_node(7)
         client.routing_table.add(Node(honest.id, IP, honest.port))
         fake_ports = [s.sockets[0].getsockname()[1] for s in servers[1:]]
         for i, port in enumerate(fake_ports[::2]):
@@ -807,7 +812,7 @@ async def test_bad_node_lists_in_lookup_replies_are_ignored():
         value, _ = await client.find_value(key)
         assert value == "10.0.0.1"
 
-        client = KademliaNode(7, IP, 0)
+        client = make_node(7)
         for i, port in enumerate(fake_ports[1::2]):
             client.routing_table.add(Node(8200 + i, IP, port))
         await client.find_node(key)  # must not raise
@@ -821,7 +826,7 @@ async def test_lookup_stops_when_a_peer_hands_out_endless_contacts():
     (all pointing back at itself) cannot keep a lookup running forever."""
     key = 10000
     owner = Ed25519PrivateKey.generate()
-    honest = KademliaNode(10003, IP, 0)
+    honest = make_node(10003)
     servers = [await start_node(honest)]
     state = {'distance': 2 ** 150, 'queries': 0}
 
@@ -846,7 +851,7 @@ async def test_lookup_stops_when_a_peer_hands_out_endless_contacts():
     servers.append(attacker)
     try:
         assert await rpc(honest.port, make_store_payload(owner, key, "10.0.0.1")[0]) == b"OK"
-        client = KademliaNode(7, IP, 0)
+        client = make_node(7)
         client.routing_table.add(Node(10001, IP, port))
         client.routing_table.add(Node(honest.id, IP, honest.port))
 
@@ -928,3 +933,62 @@ def test_unreadable_key_file_is_not_replaced(tmp_path):
     with pytest.raises(ValueError):
         KademliaNode(1, IP, 0, key_path=str(bad))
     assert bad.read_bytes() == b"not a key"
+
+
+def test_port_zero_nodes_do_not_share_a_key(tmp_path):
+    """Port 0 has no default key file (it used to be one shared node_0.key):
+    a port-0 node without key_path is refused, and port-0 nodes with their
+    own key_path get distinct keys."""
+    with pytest.raises(ValueError, match="key_path"):
+        KademliaNode(1, IP, 0)
+    assert not (tmp_path / "keys" / "node_0.key").exists()
+    assert not (tmp_path / "home" / ".p2p-net" / "node_0.key").exists()
+
+    a = make_node(1)
+    b = make_node(2)
+    assert a.key_path != b.key_path
+    assert a.owner_public_key != b.owner_public_key
+
+
+@pytest.mark.parametrize("crash_in", ["fsync", "replace"])
+def test_interrupted_key_write_leaves_no_file_at_final_path(
+        tmp_path, monkeypatch, crash_in):
+    """A key write that dies after the temp file is created (during fsync, or
+    just before the rename) leaves nothing at the final path, so the next
+    start never loads a torn key, and the temp file is cleaned up."""
+    key_path = tmp_path / "keys" / "node.key"
+    real = getattr(os, crash_in)
+
+    def crash(*args, **kwargs):
+        raise OSError(f"simulated crash in os.{crash_in}")
+
+    monkeypatch.setattr(os, crash_in, crash)
+    with pytest.raises(OSError, match="simulated crash"):
+        KademliaNode(1, IP, 0, key_path=str(key_path))
+    assert not key_path.exists()
+    assert os.listdir(key_path.parent) == []
+
+    # The next start creates a complete key (0600) at the final path.
+    monkeypatch.setattr(os, crash_in, real)
+    node = KademliaNode(1, IP, 0, key_path=str(key_path))
+    assert stat.S_IMODE(os.stat(key_path).st_mode) == 0o600
+    assert os.listdir(key_path.parent) == ["node.key"]
+    assert KademliaNode(1, IP, 0, key_path=str(key_path)).owner_public_key \
+        == node.owner_public_key
+
+
+def test_key_write_goes_through_a_private_temp_file(tmp_path, monkeypatch):
+    """The key bytes are written to a 0600 temp file in the same directory,
+    which is then renamed onto the final path with os.replace."""
+    key_path = tmp_path / "keys" / "node.key"
+    seen = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        seen.append((os.path.dirname(src), stat.S_IMODE(os.stat(src).st_mode),
+                     os.path.exists(dst), dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", spy)
+    KademliaNode(1, IP, 0, key_path=str(key_path))
+    assert seen == [(str(key_path.parent), 0o600, False, str(key_path))]

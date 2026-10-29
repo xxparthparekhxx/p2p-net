@@ -3,6 +3,7 @@ import base64
 import json
 import hashlib
 import os
+import tempfile
 import time
 from typing import List, Tuple, Dict, NamedTuple, Optional, Union
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -53,8 +54,59 @@ DEFAULT_KEY_DIR = "~/.p2p-net"
 
 
 def default_key_path(port: int) -> str:
+    """<key dir>/node_<port>.key. Port 0 has no default: the OS picks a new
+    port on every bind, so every port-0 node would share node_0.key (and one
+    identity); such a node must be given an explicit key_path."""
+    if port == 0:
+        raise ValueError(
+            "port 0 has no default key file (every port-0 node would share "
+            "node_0.key); pass an explicit key_path"
+        )
     key_dir = os.environ.get(KEY_DIR_ENV) or DEFAULT_KEY_DIR
     return os.path.join(os.path.expanduser(key_dir), f"node_{port}.key")
+
+
+def write_private_file(path: str, data: bytes,
+                       keep_existing: bool = False) -> None:
+    """Write `data` to `path` crash-safely, readable only by its owner.
+
+    The bytes go to a new temp file in the same directory (mkstemp: created
+    with O_EXCL and mode 0600), are fsynced, and only then renamed onto `path`
+    with os.replace. A crash at any point leaves either the old file or the
+    complete new one at `path`, never a torn one; on an error the temp file is
+    removed. With keep_existing, a file that appeared at `path` meanwhile is
+    left alone and FileExistsError is raised instead.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        dir=directory, prefix=f".{os.path.basename(path)}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if keep_existing and os.path.exists(path):
+            raise FileExistsError(path)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    # Persist the rename itself (the directory entry), where supported.
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 def load_or_create_signing_key(path: str) -> Ed25519PrivateKey:
@@ -62,10 +114,11 @@ def load_or_create_signing_key(path: str) -> Ed25519PrivateKey:
 
     Names are bound to the signer's public key on every node that stores
     them, so a node must keep its key across restarts to keep updating its
-    names. A new key file is created with os.open(..., O_EXCL, 0o600) so it
-    is never readable by other users, not even briefly. An existing file
-    that doesn't hold a valid key raises instead of being replaced, since
-    replacing it would silently give up ownership of every name.
+    names. A new key is written with write_private_file (temp file, 0600,
+    fsync, rename), so it is never readable by other users and a crash never
+    leaves a torn key at `path`. An existing file that doesn't hold a valid
+    key raises instead of being replaced, since replacing it would silently
+    give up ownership of every name.
     """
     try:
         with open(path, "rb") as f:
@@ -73,16 +126,11 @@ def load_or_create_signing_key(path: str) -> Ed25519PrivateKey:
     except FileNotFoundError:
         key = Ed25519PrivateKey.generate()
         pem = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
-        os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            write_private_file(path, pem, keep_existing=True)
         except FileExistsError:
             # Another process created it first: use that key.
             return load_or_create_signing_key(path)
-        with os.fdopen(fd, "wb") as f:
-            f.write(pem)
-            f.flush()
-            os.fsync(f.fileno())
         print(f"Generated a new signing key in {path}")
         return key
 
@@ -480,7 +528,8 @@ class KademliaNode:
         self.data: Dict[int, Tuple[bytes, int, str, bytes]] = {}
         # Long-term signing key used to sign records this node stores. It is
         # loaded from (or created in) key_path so it survives restarts: other
-        # nodes bind this node's names to it on first use.
+        # nodes bind this node's names to it on first use. A port-0 node has
+        # no default path and must pass key_path (see default_key_path).
         self.key_path = key_path or default_key_path(port)
         self.signing_key = load_or_create_signing_key(self.key_path)
         # This node's own public key, the owner recorded for names it stores.
