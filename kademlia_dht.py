@@ -1,16 +1,20 @@
 import asyncio
-import random
 import json
 import hashlib
-from typing import List, Tuple, Dict, Optional,Union
-from cryptography.fernet import Fernet
+from typing import List, Tuple, Dict, Optional, Union
 
 K = 20  # k-bucket size
 ALPHA = 3  # alpha concurrent network calls
 ID_BITS = 160  # SHA-1 hash size
 
+# Every message on the wire is length-prefixed: a 4-byte big-endian length
+# followed by exactly that many payload bytes. Replies are read with a loop
+# (readexactly) so a full 20-node response can never overflow a fixed buffer.
+
+
 def sha1_hash(data: str) -> int:
     return int(hashlib.sha1(data.encode()).hexdigest(), 16)
+
 
 class Node:
     def __init__(self, id: int, ip: str, port: int):
@@ -24,16 +28,21 @@ class Node:
     def __hash__(self):
         return hash(self.id)
 
+
 class KBucket:
     def __init__(self):
         self.nodes: List[Node] = []
 
     def add(self, node: Node):
+        # Kademlia least-recently-seen order: seeing a known peer again moves
+        # it to the tail of its bucket instead of just dropping it.
         if node in self.nodes:
             self.nodes.remove(node)
+            self.nodes.append(node)
         elif len(self.nodes) < K:
             self.nodes.append(node)
         return len(self.nodes) < K
+
 
 class RoutingTable:
     def __init__(self, our_id: int):
@@ -57,66 +66,74 @@ class RoutingTable:
                     break
         return sorted(nodes, key=lambda n: n.id ^ target_id)[:K]
 
+
 class KademliaProtocol:
     def __init__(self, node_id: int, kademlia_node):
         self.node_id = node_id
         self.kademlia_node = kademlia_node
 
-    async def ping(self, writer):
-        writer.write(b"PING")
+    async def _send_message(self, writer, data: bytes):
+        length = len(data).to_bytes(4, "big")
+        writer.write(length + data)
         await writer.drain()
 
+    async def _read_message(self, reader):
+        length_bytes = await reader.readexactly(4)
+        length = int.from_bytes(length_bytes, "big")
+        return await reader.readexactly(length)
+
+    async def ping(self, writer):
+        await self._send_message(writer, b"PING")
+
     async def store(self, writer, key: int, value: str):
-        message = f"STOR{key} {value}".encode()
-        writer.write(message)
-        await writer.drain()
+        message = f"STOR {key} {value}".encode()
+        await self._send_message(writer, message)
 
     async def find_node(self, writer, target_id: int):
         message = f"FIND_NODE {target_id}".encode()
-        writer.write(message)
-        await writer.drain()
+        await self._send_message(writer, message)
 
     async def find_value(self, writer, key: int):
         message = f"FIND_VALUE {key}".encode()
-        writer.write(message)
-        await writer.drain()
+        await self._send_message(writer, message)
 
-    async def handle_ping(self, reader, writer):
-        writer.write(b"PONG")
-        await writer.drain()
+    async def handle_ping(self, writer):
+        await self._send_message(writer, b"PONG")
 
-    async def handle_store(self, reader, writer):
-        data = await reader.read(1024)
-        print("storing this data",data)
-        key, value = data.decode().split(maxsplit=2)
-        self.kademlia_node.data[int(key)] = value
-        print(f"Stored key-value pair:{value} {self.kademlia_node.data}")
-        writer.write(b"OK")
-        await writer.drain()
+    async def handle_store(self, writer, payload: bytes):
+        # payload: b"STOR <key> <value>"
+        parts = payload.decode().split(maxsplit=2)
+        key = int(parts[1])
+        value = parts[2]
+        self.kademlia_node.data[key] = value
+        print(f"Stored key-value pair: {key} {value}")
+        await self._send_message(writer, b"OK")
 
-    async def handle_find_value(self, reader, writer):
-        data = await reader.read(1024)
-        _, key = data.decode().split()
-        key = int(key)
+    async def handle_find_node(self, writer, payload: bytes):
+        # payload: b"FIND_NODE <target_id>"
+        _, target_s = payload.decode().split()
+        target_id = int(target_s)
+        closest_nodes = self.kademlia_node.routing_table.find_closest(target_id)
+        response = json.dumps(
+            [{'id': node.id, 'ip': node.ip, 'port': node.port}
+             for node in closest_nodes]
+        ).encode()
+        await self._send_message(writer, response)
+
+    async def handle_find_value(self, writer, payload: bytes):
+        # payload: b"FIND_VALUE <key>"
+        _, key_s = payload.decode().split()
+        key = int(key_s)
         if key in self.kademlia_node.data:
             response = json.dumps({'value': self.kademlia_node.data[key]})
         else:
             closest_nodes = self.kademlia_node.routing_table.find_closest(key)
-            response = json.dumps({'nodes': [{'id': node.id, 'ip': node.ip, 'port': node.port} for node in closest_nodes]})
-        writer.write(response.encode())
-        await writer.drain()
+            response = json.dumps(
+                {'nodes': [{'id': node.id, 'ip': node.ip, 'port': node.port}
+                           for node in closest_nodes]}
+            )
+        await self._send_message(writer, response.encode())
 
-    async def handle_find_value(self, reader, writer):
-        data = await reader.read(1024)
-        _, key = data.decode().split()
-        key = int(key)
-        if key in self.kademlia_node.data:
-            response = json.dumps({'value': self.kademlia_node.data[key]})
-        else:
-            closest_nodes = self.kademlia_node.routing_table.find_closest(key)
-            response = json.dumps({'nodes': [{'id': node.id, 'ip': node.ip, 'port': node.port} for node in closest_nodes]})
-        writer.write(response.encode())
-        await writer.drain()
 
 class KademliaNode:
     def __init__(self, id: int, ip: str, port: int):
@@ -135,7 +152,7 @@ class KademliaNode:
         try:
             reader, writer = await asyncio.open_connection(node.ip, node.port)
             await self.protocol.ping(writer)
-            response = await reader.read(4)
+            response = await self.protocol._read_message(reader)
             if response == b"PONG":
                 self.routing_table.add(node)
                 print(f"Successfully pinged and added node {node.id}")
@@ -154,12 +171,11 @@ class KademliaNode:
                 store_tasks.append(self._store_on_node(node, key, value))
         await asyncio.gather(*store_tasks)
 
-
     async def _store_on_node(self, node: Node, key: int, value: str):
         try:
             reader, writer = await asyncio.open_connection(node.ip, node.port)
             await self.protocol.store(writer, key, value)
-            response = await reader.read(1024)
+            response = await self.protocol._read_message(reader)
             if response == b"OK":
                 print(f"Successfully stored value {value} on node {node.id}")
             else:
@@ -168,7 +184,6 @@ class KademliaNode:
             await writer.wait_closed()
         except Exception as e:
             print(f"Failed to store key {key} on node {node.id}: {e}")
-
 
     async def find_node(self, target_id: int) -> List[Node]:
         nodes = self.routing_table.find_closest(target_id)
@@ -192,7 +207,7 @@ class KademliaNode:
         try:
             reader, writer = await asyncio.open_connection(node.ip, node.port)
             await self.protocol.find_node(writer, target_id)
-            response = await reader.read(1024)
+            response = await self.protocol._read_message(reader)
             writer.close()
             await writer.wait_closed()
             nodes_data = json.loads(response.decode())
@@ -203,7 +218,7 @@ class KademliaNode:
 
     async def find_value(self, key: int) -> Tuple[Optional[str], List[Node]]:
         print(f"find_value  for key {key} on node {self.id} {self.data} ")
-        
+
         if key in self.data:
             return self.data[key], []
         nodes = self.routing_table.find_closest(key)
@@ -227,14 +242,12 @@ class KademliaNode:
 
     async def _find_value_on_node(self, node: Node, key: int) -> Union[str, List[Node], None]:
         try:
-            # print(f"_find_value_on_node  for key {key} on node {node.id} {self.data} ")
             reader, writer = await asyncio.open_connection(node.ip, node.port)
             await self.protocol.find_value(writer, key)
-            response = await reader.read(1024)
+            response = await self.protocol._read_message(reader)
             writer.close()
             await writer.wait_closed()
-            
-            # Decode the response and handle potential JSON decoding errors
+
             try:
                 result = json.loads(response.decode())
                 if 'value' in result:
@@ -255,20 +268,21 @@ class KademliaNode:
             await server.serve_forever()
 
     async def handle_connection(self, reader, writer):
-        data = await reader.read(4)
-        # print("PROCESSING THIS REQUEST" +data.decode() )
+        try:
+            data = await self.protocol._read_message(reader)
+        except (asyncio.IncompleteReadError, ConnectionResetError,
+                BrokenPipeError, OSError):
+            writer.close()
+            await writer.wait_closed()
+            return
+
         if data == b"PING":
-            await self.protocol.handle_ping(reader, writer)
-        elif data == b"STOR":
-            await self.protocol.handle_store(reader, writer)
-        elif data == b"FIND":
-            more_data = await reader.read(5)
-            more_data = more_data[1:]
-            if more_data == b"NODE":
-                print("PROCESSING THIS REQUEST for finding node", more_data)
-            if more_data == b"NODE":
-                await self.protocol.handle_find_node(reader, writer)
-            elif more_data == b"VALU":
-                await self.protocol.handle_find_value(reader, writer)
+            await self.protocol.handle_ping(writer)
+        elif data[:5] == b"STOR ":
+            await self.protocol.handle_store(writer, data)
+        elif data[:9] == b"FIND_NODE":
+            await self.protocol.handle_find_node(writer, data)
+        elif data[:10] == b"FIND_VALUE":
+            await self.protocol.handle_find_value(writer, data)
         writer.close()
         await writer.wait_closed()
