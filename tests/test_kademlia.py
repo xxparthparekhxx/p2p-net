@@ -7,7 +7,15 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from kademlia_dht import KademliaNode, Node, KBucket, K, MAX_MESSAGE_SIZE
+from kademlia_dht import (
+    KademliaNode,
+    Node,
+    KBucket,
+    K,
+    RoutingTable,
+    ID_BITS,
+    MAX_MESSAGE_SIZE,
+)
 
 IP = "127.0.0.1"
 
@@ -108,14 +116,24 @@ def test_bucket_refresh_moves_known_peer_to_tail():
 
 
 def test_routing_table_add_refreshes_bucket():
-    bucket_index = 160 - ((1 ^ 2).bit_length()) - 1
-    table = KademliaNode(1, IP, 0).routing_table
-    n1 = Node(2, IP, 2)
-    n2 = Node(3, IP, 3)
-    table.add(Node(2, IP, 2))
-    table.buckets[bucket_index].nodes = [n1]
-    assert table.buckets[bucket_index].add(Node(2, IP, 2)) is True
-    assert table.buckets[bucket_index].nodes == [n1]
+    """Seeing a known peer again via the routing table reorders its bucket."""
+    our_id = 32
+    table = RoutingTable(our_id)
+    # 32^36, 32^37 and 32^38 all have bit_length 3, so all three land in the
+    # same k-bucket.
+    n1 = Node(36, IP, 1)
+    n2 = Node(37, IP, 2)
+    n3 = Node(38, IP, 3)
+    bucket_index = ID_BITS - ((our_id ^ 36).bit_length()) - 1
+
+    table.add(n1)
+    table.add(n2)
+    table.add(n3)
+    assert table.buckets[bucket_index].nodes == [n1, n2, n3]
+
+    # Re-adding n1 keeps the bucket at 3 entries and moves n1 to the tail.
+    assert table.add(n1) is True
+    assert table.buckets[bucket_index].nodes == [n2, n3, n1]
 
 
 def make_store_payload(signing_key, key, value):
