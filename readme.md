@@ -102,7 +102,7 @@ NAT traversal is planned but not yet implemented. The Introduction Server exists
   node's Ed25519 long-term key, and peers verify the signature before storing
   anything. A STORE record is exactly five space-separated tokens:
 
-  `STORE <key> <seq> <base64 value> <base64 owner public key> <base64 signature>`
+  `STOR <key> <seq> <base64 value> <base64 owner public key> <base64 signature>`
 
   The value and both cryptographic fields are base64-encoded so values of any
   bytes (including leading/trailing spaces and the empty string) round-trip
@@ -111,15 +111,21 @@ NAT traversal is planned but not yet implemented. The Introduction Server exists
   `p2p-net/STORE/v1\0<key>\0<seq>\0<value_bytes>`
 
   where `<seq>` is an unsigned 64-bit sequence number (`time.time_ns()`)
-  written by the owner when it calls store(). A node stores `(owner public
-  key, seq, value)` per name. Names are owned on trust-on-first-use per node:
+  written by the owner when it calls store(). Values must be UTF-8 text. A
+  node stores `(owner public key, seq, value, signature)` per name. Names are
+  owned on trust-on-first-use per node:
   the first valid signed STORE for a name on a node that has never seen it
   binds it to the signer's public key there. A later STORE for that name is
   accepted only from the same owner and only with a strictly greater seq
   (an equal seq with the identical value is an idempotent no-op); anything
   else is rejected with REJECTED. This prevents replaying an old signed STORE
-  to roll a record back. FIND_VALUE returns the value, the seq and the owner
-  key. There is no global registry: ownership is independent on each node,
+  to roll a record back. Records are self-verifying: FIND_VALUE returns the
+  whole signed record (key, seq, value, owner key and signature), and a
+  lookup re-checks the signature on every reply, ignores any that fail and
+  returns the verified record with the highest seq (pass `expected_owner` to
+  accept only one owner's key). A node can refuse to answer or serve an older
+  signed copy, but it cannot forge a record under someone else's key. There
+  is no global registry: ownership is independent on each node,
   whoever stores a name first on that node becomes its owner there. Replication
   carries the original owner's signature and seq unchanged; a node never
   re-signs someone else's record with its own key.
