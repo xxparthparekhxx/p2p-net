@@ -298,6 +298,45 @@ def parse_record_reply(key: int, reply) -> VerifiedRecord:
     return VerifiedRecord(value, seq, owner, signature)
 
 
+Replica = Tuple[str, int]  # (ip, port) a verified record came from
+
+
+def select_record(key: int, replies: List[Tuple[Replica, VerifiedRecord]]
+                  ) -> Optional[VerifiedRecord]:
+    """Pick a lookup's answer from its verified replies, or None.
+
+    `replies` pairs each verified record with the replica that served it
+    (the local copy is this node's own ip and port). Records are grouped by
+    owner and the owner served by the most distinct replicas wins: a replica
+    reached under several contact ids, or more than once, counts once. Then
+    the highest seq of that owner's records is returned. A validly signed
+    record at seq 2**64-1 from one node therefore can't outvote an owner
+    that more replicas agree on. Ties are broken deterministically (equal
+    replica counts: lowest owner key; equal seqs: greatest value), so the
+    result never depends on reply order. Seeing more than one owner logs a
+    warning.
+    """
+    by_owner: Dict[bytes, Dict[Replica, VerifiedRecord]] = {}
+    for replica, record in replies:
+        held = by_owner.setdefault(record.owner, {})
+        prior = held.get(replica)
+        if prior is None or (record.seq, record.value) > (prior.seq, prior.value):
+            held[replica] = record
+    if not by_owner:
+        return None
+    owner = min(by_owner, key=lambda o: (-len(by_owner[o]), o))
+    if len(by_owner) > 1:
+        counts = ", ".join(
+            f"{o.hex()[:16]}: {len(by_owner[o])}"
+            for o in sorted(by_owner, key=lambda o: (-len(by_owner[o]), o))
+        )
+        print(f"Warning: key {key} has verified records from {len(by_owner)} "
+              f"owners (replicas per owner key: {counts}); using "
+              f"{owner.hex()[:16]}. Pin the owner (expected_owner) to stop "
+              f"relying on the majority.")
+    return max(by_owner[owner].values(), key=lambda r: (r.seq, r.value))
+
+
 def parse_node_list(entries) -> List["Node"]:
     """Turn an untrusted JSON node list into Node objects, or raise ValueError.
 
@@ -726,17 +765,29 @@ class KademliaNode:
     ) -> Tuple[Optional[str], List[Node]]:
         """Look up `key` and return (value, []) or (None, closest nodes).
 
+        See find_record for how the answer is chosen.
+        """
+        record, nodes = await self.find_record(key, expected_owner)
+        return (record.value if record is not None else None), nodes
+
+    async def find_record(
+        self, key: int, expected_owner: Optional[bytes] = None
+    ) -> Tuple[Optional[VerifiedRecord], List[Node]]:
+        """Look up `key`; return (verified record, []) or (None, closest
+        nodes).
+
         Every candidate record, the local copy included, must carry a valid
         owner signature; replies that fail verification count as no answer.
         The lookup walks the K closest nodes instead of stopping at the first
-        hit, and the verified record with the highest seq wins, so a node
-        serving an older (but genuinely signed) record loses to any fresher
-        replica it reaches. With `expected_owner` set, only records signed by
-        that public key are accepted.
+        hit. With `expected_owner` set, only records signed by that public
+        key are accepted and the highest seq wins, so a node serving an older
+        (but genuinely signed) record loses to any fresher replica. Without
+        it, select_record picks the owner served by the most distinct
+        replicas, then that owner's highest seq.
         """
         print(f"find_value for key {key} on node {self.id}")
 
-        candidates: List[VerifiedRecord] = []
+        candidates: List[Tuple[Replica, VerifiedRecord]] = []
         local = self.data.get(key)
         if local is not None:
             owner, seq, value, signature = local
@@ -746,7 +797,8 @@ class KademliaNode:
             elif expected_owner is not None and owner != expected_owner:
                 print(f"Ignoring local record for key {key}: not the expected owner")
             else:
-                candidates.append(VerifiedRecord(value, seq, owner, signature))
+                candidates.append(((self.ip, self.port),
+                                   VerifiedRecord(value, seq, owner, signature)))
 
         nodes = self.routing_table.find_closest(key)
         queried_nodes = set()
@@ -760,20 +812,17 @@ class KademliaNode:
                 for node in unqueried
             ]
             results = await asyncio.gather(*query_tasks)
-            for result in results:
+            for node, result in zip(unqueried, results):
                 if isinstance(result, VerifiedRecord):
-                    candidates.append(result)
+                    candidates.append(((node.ip, node.port), result))
                 elif result:
                     nodes.extend(result)
             queried_nodes.update(unqueried)
             nodes = sorted(set(nodes), key=lambda n: n.id ^ key)[:K]
 
-        if candidates:
-            if len({c.owner for c in candidates}) > 1:
-                print(f"Warning: key {key} has verified records from more than "
-                      f"one owner; pass expected_owner to pin the owner")
-            best = max(candidates, key=lambda c: c.seq)
-            return best.value, []
+        best = select_record(key, candidates)
+        if best is not None:
+            return best, []
         return None, nodes
 
     async def _find_value_on_node(

@@ -1,15 +1,61 @@
 import asyncio
+import os
 import random
 import json
 import base64
-from typing import Optional
+from typing import Dict, Optional
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from kademlia_dht import KademliaNode, sha1_hash, Node, connect, safe_text
+from kademlia_dht import (
+    ED25519_PUBLIC_KEY_SIZE,
+    KademliaNode,
+    Node,
+    connect,
+    safe_text,
+    sha1_hash,
+    write_private_file,
+)
 
 
 class IntroductionServerUnreachable(ConnectionError):
     """join_network could not connect to the introduction server."""
+
+
+def owner_pins_path(key_path: str) -> str:
+    """The owner-pin file sits next to the node's key file:
+    node_9000.key -> node_9000.owners.json (same directory)."""
+    root, _ = os.path.splitext(key_path)
+    return root + ".owners.json"
+
+
+def load_owner_pins(path: str) -> Dict[str, bytes]:
+    """Read {domain: owner public key} from `path` ({} if it doesn't exist).
+
+    A file that exists but can't be parsed raises instead of being treated
+    as empty: silently dropping the pins would reopen every name to an
+    unpinned (majority) lookup.
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except ValueError as e:
+        raise ValueError(f"Owner pin file {path} is not valid JSON ({e}); "
+                         f"fix or delete it")
+    if not isinstance(raw, dict):
+        raise ValueError(f"Owner pin file {path} is not a JSON object")
+    pins = {}
+    for domain, owner_b64 in raw.items():
+        try:
+            owner = base64.b64decode(owner_b64, validate=True)
+        except (TypeError, ValueError):
+            owner = b""
+        if len(owner) != ED25519_PUBLIC_KEY_SIZE:
+            raise ValueError(f"Owner pin file {path}: entry for "
+                             f"{safe_text(domain)} is not a base64 Ed25519 key")
+        pins[domain] = owner
+    return pins
 
 
 class P2PNode:
@@ -21,6 +67,27 @@ class P2PNode:
         # ~/.p2p-net/node_<port>.key) so this node keeps its names on restart.
         self.kademlia = KademliaNode(self.id, ip, port, key_path=key_path)
         self.virtual_ip = None
+        # Client-side owner pins: domain -> owner public key, recorded the
+        # first time a name resolves and enforced on every later lookup. They
+        # are saved (0600) next to the key file so they survive restarts.
+        self.owner_pins_path = owner_pins_path(self.kademlia.key_path)
+        self.owner_pins: Dict[str, bytes] = load_owner_pins(self.owner_pins_path)
+
+    def pin_owner(self, domain: str, owner: bytes):
+        """Accept only `owner`'s records for `domain` from now on."""
+        self.owner_pins[domain] = owner
+        self._save_owner_pins()
+
+    def forget_owner(self, domain: str):
+        """Drop the pin for `domain`; its next lookup is unpinned again."""
+        if self.owner_pins.pop(domain, None) is not None:
+            self._save_owner_pins()
+
+    def _save_owner_pins(self):
+        data = {domain: base64.b64encode(owner).decode()
+                for domain, owner in sorted(self.owner_pins.items())}
+        write_private_file(self.owner_pins_path,
+                           json.dumps(data, indent=1).encode())
 
     async def join_network(self, intro_server_address: tuple[str, int]):
         host, port = intro_server_address
@@ -95,14 +162,25 @@ class P2PNode:
 
     async def lookup_domain(self, domain: str,
                             owner: Optional[bytes] = None) -> Optional[str]:
-        # Pass the owner's public key, when known, to accept only its records.
+        """Resolve `domain` to its value, or None.
+
+        The first time a name resolves (unpinned: the owner most replicas
+        agree on, then its highest seq), that owner's public key is pinned,
+        and every later lookup accepts only that owner's records. Pass
+        `owner` to pin a known owner for this lookup instead of the saved
+        pin; forget_owner() drops a pin.
+        """
         domain_hash = sha1_hash(domain)
-        print(f"Looking up domain {domain} (hash: {domain_hash})")
-        result, _ = await self.kademlia.find_value(
-            domain_hash, expected_owner=owner
+        pinned = owner if owner is not None else self.owner_pins.get(domain)
+        print(f"Looking up domain {domain} (hash: {domain_hash})"
+              + (f", owner pinned to {pinned.hex()[:16]}" if pinned else ""))
+        record, _ = await self.kademlia.find_record(
+            domain_hash, expected_owner=pinned
         )
-        print(f"Lookup result for {domain}: "
-              f"{safe_text(result)}")
+        result = record.value if record is not None else None
+        if record is not None and domain not in self.owner_pins:
+            self.pin_owner(domain, record.owner)
+        print(f"Lookup result for {domain}: {safe_text(result)}")
         return result
 
     async def start(self):

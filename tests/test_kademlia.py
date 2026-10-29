@@ -28,6 +28,7 @@ from kademlia_dht import (
     STORE_DOMAIN_SEPARATOR,
     VerifiedRecord,
     parse_record_reply,
+    select_record,
     record_message,
     verify_record,
 )
@@ -1287,3 +1288,106 @@ async def test_store_logs_never_print_raw_escape_sequences(capsys):
     finally:
         server.close()
         await server.wait_closed()
+
+
+# --- Read policy: majority owner, then highest seq ---
+
+
+@pytest.mark.asyncio
+async def test_majority_owner_beats_a_malicious_max_seq_record(capsys):
+    """One malicious node serving its own validly signed record at seq
+    2**64-1 vs two honest replicas: the unpinned lookup returns the honest
+    value (highest seq across all replies used to pick 6.6.6.6), and warns
+    that two owners were seen."""
+    key = 17000
+    owner = Ed25519PrivateKey.generate()
+    attacker = Ed25519PrivateKey.generate()
+    honest = [make_node(key ^ (1 << 20)), make_node(key ^ (1 << 21))]
+    servers = [await start_node(n) for n in honest]
+    try:
+        payload, _ = make_store_payload(owner, key, "10.0.0.1")
+        for node in honest:
+            assert await rpc(node.port, payload) == b"OK"
+        evil = signed_reply(attacker, key, 2 ** 64 - 1, "6.6.6.6")
+        evil_server, evil_port = await start_reply_server(json.dumps(evil).encode())
+        servers.append(evil_server)
+
+        client = make_node(7)
+        client.routing_table.add(Node(key ^ 1, IP, evil_port))  # the closest
+        for node in honest:
+            client.routing_table.add(Node(node.id, IP, node.port))
+        capsys.readouterr()
+        record, _ = await client.find_record(key)
+        assert record.value == "10.0.0.1" and record.owner == pub(owner)
+        assert "Warning: key 17000 has verified records from 2 owners" in \
+            capsys.readouterr().out
+
+        # Pinned to the attacker, only its record is accepted.
+        value, _ = await client.find_value(key, expected_owner=pub(attacker))
+        assert value == "6.6.6.6"
+    finally:
+        await close_all(servers)
+
+
+@pytest.mark.asyncio
+async def test_one_endpoint_under_many_contact_ids_counts_once():
+    """An attacker handing out several contact ids that all point at one
+    ip:port still counts as one replica, so two honest replicas win."""
+    key = 17100
+    owner = Ed25519PrivateKey.generate()
+    attacker = Ed25519PrivateKey.generate()
+    honest = [make_node(key ^ (1 << 20)), make_node(key ^ (1 << 21))]
+    servers = [await start_node(n) for n in honest]
+    try:
+        payload, _ = make_store_payload(owner, key, "10.0.0.1")
+        for node in honest:
+            assert await rpc(node.port, payload) == b"OK"
+        evil = signed_reply(attacker, key, 2 ** 64 - 1, "6.6.6.6")
+        evil_server, evil_port = await start_reply_server(json.dumps(evil).encode())
+        servers.append(evil_server)
+
+        client = make_node(7)
+        for i in range(5):
+            client.routing_table.add(Node(key ^ (i + 1), IP, evil_port))
+        for node in honest:
+            client.routing_table.add(Node(node.id, IP, node.port))
+        assert len({n.id for b in client.routing_table.buckets for n in b.nodes}) == 7
+        value, _ = await client.find_value(key)
+        assert value == "10.0.0.1"
+    finally:
+        await close_all(servers)
+
+
+def _record(signer, key, seq, value):
+    signature = signer.sign(record_message(key, seq, value.encode()))
+    return VerifiedRecord(value, seq, pub(signer), signature)
+
+
+def test_select_record_policy():
+    """Majority owner by distinct replica, then highest seq; ties broken the
+    same way whatever the reply order; the local copy counts as one."""
+    key = 17200
+    a = Ed25519PrivateKey.generate()
+    b = Ed25519PrivateKey.generate()
+    r1, r2, r3, local = (IP, 1), (IP, 2), (IP, 3), (IP, 9)
+
+    assert select_record(key, []) is None
+
+    # Owner a on two replicas (one stale) beats owner b's huge seq on one.
+    replies = [(r1, _record(a, key, 5, "a-old")), (r2, _record(a, key, 9, "a-new")),
+               (r3, _record(b, key, 2 ** 64 - 1, "b"))]
+    for order in (replies, replies[::-1]):
+        assert select_record(key, order).value == "a-new"
+
+    # The same replica answering twice (or under two ids) counts once.
+    dup = [(r1, _record(b, key, 1, "b")), (r1, _record(b, key, 2, "b2")),
+           (r2, _record(a, key, 1, "a"))]
+    tie_winner = min(pub(a), pub(b))
+    expected = "a" if tie_winner == pub(a) else "b2"
+    for order in (dup, dup[::-1]):
+        assert select_record(key, order).value == expected
+
+    # The local copy is one replica like any other.
+    replies = [(local, _record(a, key, 1, "a")), (r1, _record(a, key, 1, "a")),
+               (r2, _record(b, key, 7, "b"))]
+    assert select_record(key, replies).value == "a"
