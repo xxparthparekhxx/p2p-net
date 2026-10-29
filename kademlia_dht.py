@@ -1,7 +1,14 @@
 import asyncio
+import base64
 import json
 import hashlib
 from typing import List, Tuple, Dict, Optional, Union
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from cryptography.exceptions import InvalidSignature
 
 K = 20  # k-bucket size
 ALPHA = 3  # alpha concurrent network calls
@@ -17,10 +24,11 @@ def sha1_hash(data: str) -> int:
 
 
 class Node:
-    def __init__(self, id: int, ip: str, port: int):
+    def __init__(self, id: int, ip: str, port: int, public_key: bytes = None):
         self.id = id
         self.ip = ip
         self.port = port
+        self.public_key = public_key
 
     def __eq__(self, other):
         return self.id == other.id
@@ -86,8 +94,21 @@ class KademliaProtocol:
         await self._send_message(writer, b"PING")
 
     async def store(self, writer, key: int, value: str):
-        message = f"STOR {key} {value}".encode()
-        await self._send_message(writer, message)
+        # Sign the record with this node's owner key and send the public key
+        # and signature so the recipient can verify ownership before storing.
+        signing_key = self.kademlia_node.signing_key
+        message = f"{key} {value}".encode()
+        signature = signing_key.sign(message)
+        public_key_bytes = signing_key.public_key().public_bytes(
+            Encoding.Raw, PublicFormat.Raw
+        )
+
+        payload = (
+            f"STOR {key} {value} "
+            f"{base64.b64encode(public_key_bytes).decode()} "
+            f"{base64.b64encode(signature).decode()}"
+        ).encode()
+        await self._send_message(writer, payload)
 
     async def find_node(self, writer, target_id: int):
         message = f"FIND_NODE {target_id}".encode()
@@ -101,10 +122,32 @@ class KademliaProtocol:
         await self._send_message(writer, b"PONG")
 
     async def handle_store(self, writer, payload: bytes):
-        # payload: b"STOR <key> <value>"
-        parts = payload.decode().split(maxsplit=2)
-        key = int(parts[1])
-        value = parts[2]
+        # payload: b"STOR <key> <value> <base64 public_key> <base64 signature>"
+        parts = payload.decode().split(maxsplit=4)
+        if len(parts) != 5:
+            print("Rejecting malformed STORE: missing fields")
+            await self._send_message(writer, b"REJECTED")
+            return
+        _, key_s, value, public_key_b64, signature_b64 = parts
+        key = int(key_s)
+
+        try:
+            public_key_bytes = base64.b64decode(public_key_b64)
+            signature = base64.b64decode(signature_b64)
+        except Exception:
+            print("Rejecting STORE: bad encoding")
+            await self._send_message(writer, b"REJECTED")
+            return
+
+        public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
+        message = f"{key} {value}".encode()
+        try:
+            public_key.verify(signature, message)
+        except InvalidSignature:
+            print(f"Rejecting STORE: bad signature for key {key}")
+            await self._send_message(writer, b"REJECTED")
+            return
+
         self.kademlia_node.data[key] = value
         print(f"Stored key-value pair: {key} {value}")
         await self._send_message(writer, b"OK")
@@ -142,6 +185,8 @@ class KademliaNode:
         self.port = port
         self.routing_table = RoutingTable(id)
         self.data: Dict[int, str] = {}
+        # Long-term signing key used to sign records this node stores.
+        self.signing_key = Ed25519PrivateKey.generate()
         self.protocol = KademliaProtocol(id, self)
 
     async def bootstrap(self, bootstrap_nodes: List[Node]):

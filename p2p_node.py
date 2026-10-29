@@ -1,7 +1,9 @@
 import asyncio
 import random
 import json
-from cryptography.fernet import Fernet, InvalidToken
+import base64
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from kademlia_dht import KademliaNode, sha1_hash, Node
 
 class P2PNode:
@@ -11,46 +13,48 @@ class P2PNode:
         self.id = sha1_hash(f"{ip}:{port}")
         self.kademlia = KademliaNode(self.id, ip, port)
         self.virtual_ip = None
-        self.cipher_suite = None
 
     async def join_network(self, intro_server_address: tuple[str, int]):
         try:
             reader, writer = await asyncio.open_connection(*intro_server_address)
-            
+
             # Send our listening address and port to the introduction server
             peer_info = {
                 'listening_ip': self.ip,
-                'listening_port': self.port
+                'listening_port': self.port,
+                # Advertise this node's Ed25519 public key so peers can
+                # verify records it stores.
+                'public_key': base64.b64encode(
+                    self.kademlia.signing_key.public_key().public_bytes(
+                        Encoding.Raw, PublicFormat.Raw
+                    )
+                ).decode(),
             }
             writer.write(json.dumps(peer_info).encode())
             await writer.drain()
-            
-            key_data = await reader.read(44)
-            fernet_key = key_data.decode()
-            if len(fernet_key) != 44:
-                raise ValueError(f"Invalid Fernet key length: {len(fernet_key)}")
-            
-            cipher = Fernet(fernet_key)
-            encrypted_message = await reader.read()
-            
-            decrypted_data = cipher.decrypt(encrypted_message).decode()
-            response = json.loads(decrypted_data)
-            
+
+            # The introduction server no longer ships a plaintext network key.
+            # The response is plain JSON: records are authenticated by Ed25519
+            # signatures on STORE rather than a shared symmetric key.
+            response_data = await reader.read(4096)
+            response = json.loads(response_data.decode())
+
             self.virtual_ip = response['virtual_ip']
-            self.cipher_suite = Fernet(response['encryption_key'].encode())
 
             bootstrap_nodes = [
-                Node(sha1_hash(f"{peer_info['public_ip']}:{peer_info['port']}"),
-                     peer_info['public_ip'], 
-                     peer_info['port'])
-                for peer_info in response['nearby_peers']
+                Node(sha1_hash(f"{peer['public_ip']}:{peer['port']}"),
+                     peer['public_ip'],
+                     peer['port'],
+                     public_key=base64.b64decode(peer['public_key'])
+                     if peer.get('public_key') else None)
+                for peer in response['nearby_peers']
             ]
-            
+
             if bootstrap_nodes:
                 await self.kademlia.bootstrap(bootstrap_nodes)
             else:
                 print("No bootstrap nodes available")
-            
+
             print(f"Joined network with virtual IP: {self.virtual_ip}")
 
         except Exception as e:
