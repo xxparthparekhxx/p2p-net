@@ -17,6 +17,9 @@ ID_BITS = 160  # SHA-1 hash size
 # Every message on the wire is length-prefixed: a 4-byte big-endian length
 # followed by exactly that many payload bytes. Replies are read with a loop
 # (readexactly) so a full 20-node response can never overflow a fixed buffer.
+# The declared length is capped so a peer cannot make us allocate an
+# arbitrarily large buffer; larger messages are rejected.
+MAX_MESSAGE_SIZE = 1024 * 1024  # 1 MB
 
 
 def sha1_hash(data: str) -> int:
@@ -88,6 +91,11 @@ class KademliaProtocol:
     async def _read_message(self, reader):
         length_bytes = await reader.readexactly(4)
         length = int.from_bytes(length_bytes, "big")
+        if length > MAX_MESSAGE_SIZE:
+            raise ValueError(
+                f"Rejecting {length}-byte message: over the "
+                f"{MAX_MESSAGE_SIZE}-byte cap"
+            )
         return await reader.readexactly(length)
 
     async def ping(self, writer):
@@ -358,7 +366,8 @@ class KademliaNode:
         try:
             data = await self.protocol._read_message(reader)
         except (asyncio.IncompleteReadError, ConnectionResetError,
-                BrokenPipeError, OSError):
+                BrokenPipeError, OSError, ValueError):
+            # ValueError covers messages whose length prefix exceeds the cap.
             writer.close()
             await writer.wait_closed()
             return

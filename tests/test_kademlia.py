@@ -7,7 +7,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from kademlia_dht import KademliaNode, Node, KBucket, K
+from kademlia_dht import KademliaNode, Node, KBucket, K, MAX_MESSAGE_SIZE
 
 IP = "127.0.0.1"
 
@@ -217,6 +217,26 @@ async def test_store_accepts_values_with_spaces():
 
         reply = await rpc(node.port, f"FIND_VALUE {key}".encode())
         assert json.loads(reply.decode())['value'] == "hello world"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_oversize_length_prefix_closes_connection():
+    """A length prefix over the 1 MB cap is rejected, not allocated."""
+    node = KademliaNode(1, IP, 0)
+    server = await start_node(node)
+    try:
+        reader, writer = await asyncio.open_connection(IP, node.port)
+        # Declare a 100 MB message: far over MAX_MESSAGE_SIZE.
+        writer.write((100 * 1024 * 1024).to_bytes(4, "big"))
+        await writer.drain()
+        # The server must hang up instead of allocating a 100 MB buffer.
+        assert await reader.read() == b""
+        assert node.data == {}
+        writer.close()
+        await writer.wait_closed()
     finally:
         server.close()
         await server.wait_closed()
