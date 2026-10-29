@@ -89,3 +89,26 @@ def test_small_network_is_exhausted_without_network_or_broadcast():
         server.assign_virtual_ip()
     server.release_virtual_ip("192.168.5.1")
     assert server.assign_virtual_ip() == "192.168.5.1"
+
+
+@pytest.mark.asyncio
+async def test_join_log_escapes_peer_supplied_address(capsys):
+    """The peer's listening address is printed as repr(), so control
+    characters it sends can't reach the operator's terminal."""
+    server = IntroductionServer()
+    srv = await asyncio.start_server(server.handle_new_peer, IP, 0)
+    port = srv.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection(IP, port)
+        writer.write(json.dumps({'listening_ip': "\x1b[2J\x1b]0;x\x07",
+                                 'listening_port': "\x1b[31m"}).encode())
+        await writer.drain()
+        await asyncio.wait_for(reader.read(4096), 10)
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        srv.close()
+        await srv.wait_closed()
+    out = capsys.readouterr().out
+    assert "New peer joined" in out
+    assert "\x1b" not in out and "\x07" not in out

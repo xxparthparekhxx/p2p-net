@@ -92,7 +92,10 @@ class IntroductionServer:
             'public_key': public_key_bytes,
         }
 
-        print(f"New peer joined: {listening_ip}:{listening_port} assigned {virtual_ip}")
+        # The address and port are whatever the peer sent: print their repr
+        # so control characters can't reach the operator's terminal.
+        print(f"New peer joined: {listening_ip!r} port {listening_port!r} "
+              f"assigned {virtual_ip}")
 
         writer.close()
         await writer.wait_closed()

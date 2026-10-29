@@ -5,7 +5,7 @@ import base64
 from typing import Optional
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from kademlia_dht import KademliaNode, sha1_hash, Node, connect
+from kademlia_dht import KademliaNode, sha1_hash, Node, connect, safe_text
 
 
 class IntroductionServerUnreachable(ConnectionError):
@@ -89,7 +89,8 @@ class P2PNode:
         if stored_value == ip:
             print(f"Registration of {domain} succeeded")
         else:
-            print(f"Registration of {domain} failed. Expected {ip}, found {stored_value}")
+            print(f"Registration of {domain} failed. Expected {ip}, found "
+                  f"{safe_text(stored_value)}")
         return stored_value == ip
 
     async def lookup_domain(self, domain: str,
@@ -100,7 +101,8 @@ class P2PNode:
         result, _ = await self.kademlia.find_value(
             domain_hash, expected_owner=owner
         )
-        print(f"Lookup result for {domain}: {result}")
+        print(f"Lookup result for {domain}: "
+              f"{safe_text(result)}")
         return result
 
     async def start(self):
@@ -154,7 +156,8 @@ async def main():
     print("Looking up domains...")
     for domain in ["example.com", "test.com", "nonexistent.com"]:
         ip = await nodes[5].lookup_domain(domain)
-        print(f"Domain {domain} resolves to: {ip}")
+        print(f"Domain {domain} resolves to: "
+              f"{safe_text(ip)}")
 
     # If you want to run indefinitely, you can wait on the run_tasks
     # await asyncio.gather(*run_tasks)

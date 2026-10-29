@@ -166,6 +166,21 @@ def load_or_create_signing_key(path: str) -> Ed25519PrivateKey:
     return key
 
 
+# Untrusted text (stored values, peer replies, contact addresses) is logged
+# through safe_text: repr() escapes control characters, so terminal escape
+# sequences in a value never reach the operator's console, and long values
+# are cut to LOG_TEXT_LIMIT characters.
+LOG_TEXT_LIMIT = 80
+
+
+def safe_text(text, limit: int = LOG_TEXT_LIMIT) -> str:
+    """A printable one-line form of untrusted str or bytes (or None) for
+    logging."""
+    if isinstance(text, (str, bytes)) and len(text) > limit:
+        return f"{text[:limit]!r}... ({len(text)} long)"
+    return repr(text)
+
+
 async def connect(ip: str, port: int):
     """asyncio.open_connection bounded by CONNECT_TIMEOUT (read at call time).
 
@@ -177,7 +192,8 @@ async def connect(ip: str, port: int):
         )
     except asyncio.TimeoutError:
         raise TimeoutError(
-            f"connecting to {ip}:{port} timed out after {CONNECT_TIMEOUT}s"
+            f"connecting to {safe_text(ip)} port {port} timed out after "
+            f"{CONNECT_TIMEOUT}s"
         ) from None
 
 
@@ -596,14 +612,14 @@ class KademliaNode:
                 return False, (f"node is full ({MAX_RECORDS} records); not "
                                f"taking new key {key}")
             self.data[key] = (owner, seq, value, signature)
-            return True, f"Stored key-value pair: {key} {value}"
+            return True, f"Stored key-value pair: {key} {safe_text(value)}"
 
         stored_owner, stored_seq, stored_value, _ = record
         if stored_owner != owner:
             return False, f"key {key} is owned by a different key"
         if seq > stored_seq:
             self.data[key] = (owner, seq, value, signature)
-            return True, f"Updated key-value pair: {key} {value}"
+            return True, f"Updated key-value pair: {key} {safe_text(value)}"
         if seq == stored_seq and value == stored_value:
             return True, f"Idempotent re-store of key {key}: no change"
         return False, (f"key {key} seq {seq} not greater than stored seq "
@@ -624,7 +640,8 @@ class KademliaNode:
             writer.close()
             await writer.wait_closed()
         except Exception as e:
-            print(f"Failed to ping node {node.id} : Tried Pinging {node.ip}:{node.port} : {e}")
+            print(f"Failed to ping node {node.id} : Tried Pinging "
+                  f"{safe_text(node.ip)} port {node.port} : {e}")
 
     async def store(self, key: int, value: str):
         # One seq and one signature for this store op, carried unchanged to
@@ -664,9 +681,10 @@ class KademliaNode:
             await self.protocol.store(writer, key, value, seq, signature)
             response = await self.protocol._read_message(reader)
             if response == b"OK":
-                print(f"Successfully stored value {value} on node {node.id}")
+                print(f"Successfully stored value {safe_text(value)} on node {node.id}")
             else:
-                print(f"Failed to store value {value} on node {node.id}: {response.decode()}")
+                print(f"Failed to store value {safe_text(value)} on node "
+                      f"{node.id}: {safe_text(response)}")
             writer.close()
             await writer.wait_closed()
         except Exception as e:
@@ -716,7 +734,7 @@ class KademliaNode:
         replica it reaches. With `expected_owner` set, only records signed by
         that public key are accepted.
         """
-        print(f"find_value  for key {key} on node {self.id} {self.data} ")
+        print(f"find_value for key {key} on node {self.id}")
 
         candidates: List[VerifiedRecord] = []
         local = self.data.get(key)

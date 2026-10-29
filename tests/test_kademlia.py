@@ -1244,3 +1244,46 @@ async def test_max_records_is_enforced(monkeypatch):
     finally:
         server.close()
         await server.wait_closed()
+
+
+# --- Console safety ---
+
+ESCAPES = "\x1b]0;pwned\x07\x1b[2J\x9b31m‮"
+
+
+def assert_console_safe(text):
+    for ch in ("\x1b", "\x07", "\x9b", "‮"):
+        assert ch not in text, repr(ch)
+
+
+@pytest.mark.asyncio
+async def test_store_logs_never_print_raw_escape_sequences(capsys):
+    """handle_store logs values via repr(), truncated, so terminal escape
+    sequences in a value (or a peer's reply) never reach the console."""
+    node = make_node(1)
+    server = await start_node(node)
+    owner = Ed25519PrivateKey.generate()
+    key = 16000
+    try:
+        payload, _ = make_store_payload(owner, key, ESCAPES)
+        assert await rpc(node.port, payload) == b"OK"
+        payload, _ = make_store_payload(owner, key, "\x1b[31m" * 50_000)
+        assert await rpc(node.port, payload) == b"OK"
+        out = capsys.readouterr().out
+        assert_console_safe(out)
+        assert "\\x1b]0;pwned\\x07" in out  # shown escaped
+        assert max(len(line) for line in out.splitlines()) < 300  # truncated
+
+        # A replica answering a STORE with escape sequences is logged safely.
+        reply_server, port = await start_reply_server(b"\x1b[2J" + ESCAPES.encode())
+        try:
+            await node._store_on_node(Node(99, IP, port), key + 1, ESCAPES,
+                                      time.time_ns())
+        finally:
+            await close_all([reply_server])
+        out = capsys.readouterr().out
+        assert "Failed to store value" in out
+        assert_console_safe(out)
+    finally:
+        server.close()
+        await server.wait_closed()
