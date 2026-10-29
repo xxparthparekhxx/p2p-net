@@ -75,9 +75,9 @@ Peer connections follow this process:
 
 ### **NAT Traversal**
 
-NAT traversal is achieved through a combination of:
-- **Hole Punching:** Leveraging the Introduction Server to facilitate direct connections between peers behind NATs.
-- **UPnP and STUN:** Optional support for Universal Plug and Play (UPnP) and Session Traversal Utilities for NAT (STUN) for more robust NAT traversal.
+NAT traversal is planned but not yet implemented. The Introduction Server exists as a bootstrap rendezvous point; the following techniques are on the roadmap:
+- **Hole Punching:** Planned — leverage the Introduction Server to facilitate direct connections between peers behind NATs.
+- **UPnP and STUN:** Planned — optional support for Universal Plug and Play (UPnP) and Session Traversal Utilities for NAT (STUN) for more robust NAT traversal.
 
 ## **Implementation Details**
 
@@ -97,9 +97,10 @@ NAT traversal is achieved through a combination of:
 
 ### **Security Considerations**
 
-- **Encryption:** All communication between peers is encrypted using industry-standard cryptographic algorithms.
-- **Authentication:** Peers are authenticated using public key cryptography.
-- **Resilience:** The protocol is designed to handle malicious nodes by incorporating redundancy and cryptographic verification.
+Security is planned but not yet built:
+- **Encryption:** Planned — all communication between peers is intended to be encrypted using industry-standard cryptographic algorithms (currently the network key travels in plain text ahead of the message it encrypts).
+- **Authentication:** Planned — peers are intended to be authenticated using public key cryptography (currently records are not signed, so anyone can overwrite a name).
+- **Resilience:** Planned — the protocol is designed to handle malicious nodes by incorporating redundancy and cryptographic verification.
 
 ## **Future Work**
 
