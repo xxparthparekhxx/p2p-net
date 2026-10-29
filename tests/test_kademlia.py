@@ -726,3 +726,39 @@ async def test_non_utf8_value_is_rejected_and_server_keeps_serving():
     finally:
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_malformed_find_requests_get_an_empty_reply():
+    """Malformed FIND_VALUE / FIND_NODE requests get an empty result with no
+    unhandled exception, and the next request on a new connection works."""
+    loop = asyncio.get_running_loop()
+    unhandled = []
+    old_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, ctx: unhandled.append(ctx))
+
+    node = KademliaNode(1, IP, 0)
+    server = await start_node(node)
+    owner = Ed25519PrivateKey.generate()
+    key = 7000
+    bad_args = [b"", b" abc", b" 1 2", b" \xff", b" -1",
+                b" " + str(2 ** ID_BITS).encode(),
+                b" " + str(2 ** 400).encode()]
+    try:
+        assert await rpc(node.port, make_store_payload(owner, key, "10.0.0.1")[0]) == b"OK"
+        node.routing_table.add(Node(2, IP, 1))
+        for arg in bad_args:
+            reply = await rpc(node.port, b"FIND_VALUE" + arg)
+            assert json.loads(reply.decode()) == {'nodes': []}, arg
+            reply = await rpc(node.port, b"FIND_NODE" + arg)
+            assert json.loads(reply.decode()) == [], arg
+
+        reply = json.loads((await rpc(node.port, f"FIND_VALUE {key}".encode())).decode())
+        assert parse_record_reply(key, reply).value == "10.0.0.1"
+        reply = json.loads((await rpc(node.port, b"FIND_NODE 5")).decode())
+        assert [n['id'] for n in reply] == [2]
+        assert unhandled == []
+    finally:
+        loop.set_exception_handler(old_handler)
+        server.close()
+        await server.wait_closed()

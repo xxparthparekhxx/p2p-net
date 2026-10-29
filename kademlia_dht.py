@@ -317,10 +317,31 @@ class KademliaProtocol:
         )
         await self._send_message(writer, b"REJECTED")
 
+    @staticmethod
+    def _parse_id_request(payload: bytes, command: str) -> Optional[int]:
+        """Parse b"<command> <id>" into an id in [0, 2**ID_BITS), or None.
+
+        Out-of-range ids are refused too: find_closest would index past the
+        bucket list for ids of more than 2 * ID_BITS bits.
+        """
+        try:
+            parts = payload.decode().split()
+            if len(parts) != 2 or parts[0] != command:
+                return None
+            target = int(parts[1])
+        except ValueError:  # includes UnicodeDecodeError
+            return None
+        if not 0 <= target < 2 ** ID_BITS:
+            return None
+        return target
+
     async def handle_find_node(self, writer, payload: bytes):
         # payload: b"FIND_NODE <target_id>"
-        _, target_s = payload.decode().split()
-        target_id = int(target_s)
+        target_id = self._parse_id_request(payload, "FIND_NODE")
+        if target_id is None:
+            print("Malformed FIND_NODE request: replying with no nodes")
+            await self._send_message(writer, b"[]")
+            return
         closest_nodes = self.kademlia_node.routing_table.find_closest(target_id)
         response = json.dumps(
             [{'id': node.id, 'ip': node.ip, 'port': node.port}
@@ -330,8 +351,11 @@ class KademliaProtocol:
 
     async def handle_find_value(self, writer, payload: bytes):
         # payload: b"FIND_VALUE <key>"
-        _, key_s = payload.decode().split()
-        key = int(key_s)
+        key = self._parse_id_request(payload, "FIND_VALUE")
+        if key is None:
+            print("Malformed FIND_VALUE request: replying with no nodes")
+            await self._send_message(writer, json.dumps({'nodes': []}).encode())
+            return
         if key in self.kademlia_node.data:
             # Return the whole signed record (key, seq, value, owner public
             # key and signature) so the caller can verify it on its own; this
@@ -567,13 +591,22 @@ class KademliaNode:
             await writer.wait_closed()
             return
 
-        if data == b"PING":
-            await self.protocol.handle_ping(writer)
-        elif data[:5] == b"STOR ":
-            await self.protocol.handle_store(writer, data)
-        elif data[:9] == b"FIND_NODE":
-            await self.protocol.handle_find_node(writer, data)
-        elif data[:10] == b"FIND_VALUE":
-            await self.protocol.handle_find_value(writer, data)
-        writer.close()
-        await writer.wait_closed()
+        try:
+            if data == b"PING":
+                await self.protocol.handle_ping(writer)
+            elif data[:5] == b"STOR ":
+                await self.protocol.handle_store(writer, data)
+            elif data[:9] == b"FIND_NODE":
+                await self.protocol.handle_find_node(writer, data)
+            elif data[:10] == b"FIND_VALUE":
+                await self.protocol.handle_find_value(writer, data)
+        except Exception as e:
+            # E.g. the peer hung up before the reply was written: log it and
+            # close instead of leaving an unhandled exception in the server.
+            print(f"Error handling request: {e}")
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
