@@ -21,6 +21,10 @@ from cryptography.exceptions import InvalidSignature
 K = 20  # k-bucket size
 ALPHA = 3  # alpha concurrent network calls
 ID_BITS = 160  # SHA-1 hash size
+# Most nodes a single lookup will query. Contacts in replies are unverified,
+# so a malicious peer can keep handing out fresh, ever-closer ids; without a
+# cap find_node / find_value would never terminate.
+MAX_LOOKUP_QUERIES = 4 * K
 
 # Every message on the wire is length-prefixed: a 4-byte big-endian length
 # followed by exactly that many payload bytes. Replies are read with a loop
@@ -549,7 +553,8 @@ class KademliaNode:
             return []
         queried_nodes = set()
         while True:
-            unqueried = [node for node in nodes if node not in queried_nodes][:ALPHA]
+            budget = min(ALPHA, MAX_LOOKUP_QUERIES - len(queried_nodes))
+            unqueried = [node for node in nodes if node not in queried_nodes][:budget]
             if not unqueried:
                 break
             query_tasks = [self._find_node_on_node(node, target_id) for node in unqueried]
@@ -603,7 +608,8 @@ class KademliaNode:
         nodes = self.routing_table.find_closest(key)
         queried_nodes = set()
         while True:
-            unqueried = [node for node in nodes if node not in queried_nodes][:ALPHA]
+            budget = min(ALPHA, MAX_LOOKUP_QUERIES - len(queried_nodes))
+            unqueried = [node for node in nodes if node not in queried_nodes][:budget]
             if not unqueried:
                 break
             query_tasks = [

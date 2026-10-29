@@ -17,6 +17,7 @@ from kademlia_dht import (
     K,
     RoutingTable,
     ID_BITS,
+    MAX_LOOKUP_QUERIES,
     MAX_MESSAGE_SIZE,
     READ_TIMEOUT,
     STORE_DOMAIN_SEPARATOR,
@@ -810,6 +811,53 @@ async def test_bad_node_lists_in_lookup_replies_are_ignored():
         for i, port in enumerate(fake_ports[1::2]):
             client.routing_table.add(Node(8200 + i, IP, port))
         await client.find_node(key)  # must not raise
+    finally:
+        await close_all(servers)
+
+
+@pytest.mark.asyncio
+async def test_lookup_stops_when_a_peer_hands_out_endless_contacts():
+    """A peer that answers every query with 20 fresh, ever-closer contacts
+    (all pointing back at itself) cannot keep a lookup running forever."""
+    key = 10000
+    owner = Ed25519PrivateKey.generate()
+    honest = KademliaNode(10003, IP, 0)
+    servers = [await start_node(honest)]
+    state = {'distance': 2 ** 150, 'queries': 0}
+
+    async def endless(reader, writer):
+        try:
+            length = int.from_bytes(await reader.readexactly(4), "big")
+            request = await reader.readexactly(length)
+            state['queries'] += 1
+            contacts = []
+            for _ in range(K):
+                state['distance'] -= 1
+                contacts.append({'id': key ^ state['distance'], 'ip': IP, 'port': port})
+            body = {'nodes': contacts} if request.startswith(b"FIND_VALUE") else contacts
+            reply = json.dumps(body).encode()
+            writer.write(len(reply).to_bytes(4, "big") + reply)
+            await writer.drain()
+        finally:
+            writer.close()
+
+    attacker = await asyncio.start_server(endless, IP, 0)
+    port = attacker.sockets[0].getsockname()[1]
+    servers.append(attacker)
+    try:
+        assert await rpc(honest.port, make_store_payload(owner, key, "10.0.0.1")[0]) == b"OK"
+        client = KademliaNode(7, IP, 0)
+        client.routing_table.add(Node(10001, IP, port))
+        client.routing_table.add(Node(honest.id, IP, honest.port))
+
+        value, _ = await asyncio.wait_for(client.find_value(key), 10)
+        assert value == "10.0.0.1"
+        assert state['queries'] < MAX_LOOKUP_QUERIES
+
+        state['queries'] = 0
+        result = await asyncio.wait_for(client.find_node(key), 10)
+        assert len(result) <= K
+        assert state['queries'] < MAX_LOOKUP_QUERIES
     finally:
         await close_all(servers)
 
