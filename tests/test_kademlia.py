@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import time
 
 import pytest
 
@@ -15,6 +16,8 @@ from kademlia_dht import (
     RoutingTable,
     ID_BITS,
     MAX_MESSAGE_SIZE,
+    READ_TIMEOUT,
+    STORE_DOMAIN_SEPARATOR,
 )
 
 IP = "127.0.0.1"
@@ -136,17 +139,36 @@ def test_routing_table_add_refreshes_bucket():
     assert table.buckets[bucket_index].nodes == [n2, n3, n1]
 
 
-def make_store_payload(signing_key, key, value):
-    """Build a signed STOR payload the same way KademliaProtocol.store does."""
+def make_store_payload(signing_key, key, value, seq=None):
+    """Build a signed STOR payload the same way KademliaProtocol.store does.
+
+    Wire format: STOR <key> <seq> <base64 value> <base64 public_key>
+                 <base64 signature>  (five space-separated tokens after STOR)
+    The signature covers the domain-separated key || seq || value.
+    Returns (payload, seq).
+    """
+    if seq is None:
+        seq = time.time_ns()
     public_key_bytes = signing_key.public_key().public_bytes(
         Encoding.Raw, PublicFormat.Raw
     )
-    signature = signing_key.sign(f"{key} {value}".encode())
-    return (
-        f"STOR {key} {value} "
+    value_bytes = value.encode() if isinstance(value, str) else value
+    message = (
+        STORE_DOMAIN_SEPARATOR
+        + str(key).encode()
+        + b"\0"
+        + str(seq).encode()
+        + b"\0"
+        + value_bytes
+    )
+    signature = signing_key.sign(message)
+    payload = (
+        f"STOR {key} {seq} "
+        f"{base64.b64encode(value_bytes).decode()} "
         f"{base64.b64encode(public_key_bytes).decode()} "
         f"{base64.b64encode(signature).decode()}"
     ).encode()
+    return payload, seq
 
 
 async def rpc(port, payload):
@@ -169,29 +191,48 @@ async def test_store_binds_name_to_first_signer():
     owner = Ed25519PrivateKey.generate()
     attacker = Ed25519PrivateKey.generate()
     key = 12345
+    owner_key = owner.public_key().public_bytes(
+        Encoding.Raw, PublicFormat.Raw
+    )
     try:
         # The first valid signed STORE binds the name to the signer's key.
-        assert await rpc(node.port, make_store_payload(owner, key, "10.0.0.1")) == b"OK"
-        assert node.data[key] == (
-            owner.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
-            "10.0.0.1",
-        )
+        payload, seq1 = make_store_payload(owner, key, "10.0.0.1")
+        assert await rpc(node.port, payload) == b"OK"
+        assert node.data[key] == (owner_key, seq1, "10.0.0.1")
 
         # An attacker with a different key is rejected, value unchanged.
         assert await rpc(
-            node.port, make_store_payload(attacker, key, "10.0.0.666")
+            node.port, make_store_payload(attacker, key, "10.0.0.666")[0]
         ) == b"REJECTED"
-        assert node.data[key] == (
-            owner.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
-            "10.0.0.1",
-        )
+        assert node.data[key] == (owner_key, seq1, "10.0.0.1")
 
-        # The rightful owner can still update the record.
-        assert await rpc(node.port, make_store_payload(owner, key, "10.0.0.2")) == b"OK"
-        assert node.data[key] == (
-            owner.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
-            "10.0.0.2",
-        )
+        # The rightful owner can still update the record with a higher seq.
+        payload, seq2 = make_store_payload(owner, key, "10.0.0.2")
+        assert seq2 > seq1
+        assert await rpc(node.port, payload) == b"OK"
+        assert node.data[key] == (owner_key, seq2, "10.0.0.2")
+
+        # Replaying the old signed v1 STORE is rejected; value stays v2.
+        assert await rpc(node.port, make_store_payload(owner, key, "10.0.0.1", seq1)[0]) == b"REJECTED"
+        assert node.data[key] == (owner_key, seq2, "10.0.0.2")
+
+        # A lower seq with a different value is rejected.
+        assert await rpc(
+            node.port, make_store_payload(owner, key, "10.0.0.999", seq1)[0]
+        ) == b"REJECTED"
+        assert node.data[key] == (owner_key, seq2, "10.0.0.2")
+
+        # An equal seq with a different value is rejected.
+        assert await rpc(
+            node.port, make_store_payload(owner, key, "10.0.0.777", seq2)[0]
+        ) == b"REJECTED"
+        assert node.data[key] == (owner_key, seq2, "10.0.0.2")
+
+        # An equal seq with the identical value is OK but changes nothing.
+        assert await rpc(
+            node.port, make_store_payload(owner, key, "10.0.0.2", seq2)[0]
+        ) == b"OK"
+        assert node.data[key] == (owner_key, seq2, "10.0.0.2")
     finally:
         server.close()
         await server.wait_closed()
@@ -199,16 +240,18 @@ async def test_store_binds_name_to_first_signer():
 
 @pytest.mark.asyncio
 async def test_find_value_returns_owner_key():
-    """FIND_VALUE replies with the owner public key next to the value."""
+    """FIND_VALUE replies with the owner public key and seq next to the value."""
     node = KademliaNode(1, IP, 0)
     server = await start_node(node)
     owner = Ed25519PrivateKey.generate()
     key = 54321
     try:
-        await rpc(node.port, make_store_payload(owner, key, "10.0.0.7"))
+        payload, seq = make_store_payload(owner, key, "10.0.0.7")
+        await rpc(node.port, payload)
         reply = await rpc(node.port, f"FIND_VALUE {key}".encode())
         result = json.loads(reply.decode())
         assert result['value'] == "10.0.0.7"
+        assert result['seq'] == seq
         expected_owner = owner.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         assert base64.b64decode(result['owner']) == expected_owner
     finally:
@@ -225,9 +268,9 @@ async def test_store_accepts_values_with_spaces():
     key = 777
     try:
         assert await rpc(
-            node.port, make_store_payload(owner, key, "hello world")
+            node.port, make_store_payload(owner, key, "hello world")[0]
         ) == b"OK"
-        owner_key, value = node.data[key]
+        owner_key, seq, value = node.data[key]
         assert value == "hello world"
         assert owner_key == owner.public_key().public_bytes(
             Encoding.Raw, PublicFormat.Raw
@@ -235,6 +278,25 @@ async def test_store_accepts_values_with_spaces():
 
         reply = await rpc(node.port, f"FIND_VALUE {key}".encode())
         assert json.loads(reply.decode())['value'] == "hello world"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_store_values_round_trip_exactly():
+    """Values of any bytes, including leading/trailing spaces and "", round-trip."""
+    node = KademliaNode(1, IP, 0)
+    server = await start_node(node)
+    owner = Ed25519PrivateKey.generate()
+    key = 31337
+    try:
+        for value in ["  padded  ", "", "a b  c", "x\ty\nz"]:
+            payload, _ = make_store_payload(owner, key, value)
+            assert await rpc(node.port, payload) == b"OK", value
+            assert node.data[key][2] == value, value
+            reply = await rpc(node.port, f"FIND_VALUE {key}".encode())
+            assert json.loads(reply.decode())['value'] == value, value
     finally:
         server.close()
         await server.wait_closed()
@@ -256,5 +318,112 @@ async def test_oversize_length_prefix_closes_connection():
         writer.close()
         await writer.wait_closed()
     finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_replicated_record_keeps_original_owner_and_seq():
+    """A record replicated from node A to node B keeps the original owner and
+    seq, and an attacker cannot take over the name on B."""
+    node_a = KademliaNode(1, IP, 0)
+    node_b = KademliaNode(2, IP, 0)
+    server_b = await start_node(node_b)
+    attacker = Ed25519PrivateKey.generate()
+    key = 4242
+    # Node A is the original owner; it signs with its own long-term key.
+    owner_key = node_a.owner_public_key
+    try:
+        # Node A replicates the record to node B directly; this carries node A's
+        # signature and seq unchanged (node A is the original owner).
+        value = "10.0.0.1"
+        seq = time.time_ns()
+        await node_a._store_on_node(
+            Node(node_b.id, node_b.ip, node_b.port), key, value, seq
+        )
+
+        # Node B recorded the original owner and seq, not its own.
+        assert key in node_b.data
+        owner_b, seq_b, value_b = node_b.data[key]
+        assert owner_b == owner_key
+        assert seq_b == seq
+        assert value_b == value
+
+        # An attacker with a different key cannot take over the name on B.
+        assert await rpc(
+            node_b.port, make_store_payload(attacker, key, "10.0.0.666")[0]
+        ) == b"REJECTED"
+        assert node_b.data[key] == (owner_b, seq_b, value)
+    finally:
+        server_b.close()
+        await server_b.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_short_public_key_is_rejected_not_dropped():
+    """A valid-base64 public key that isn't 32 bytes gets REJECTED, and the
+    connection stays open instead of being dropped without a reply."""
+    node = KademliaNode(1, IP, 0)
+    server = await start_node(node)
+    owner = Ed25519PrivateKey.generate()
+    key = 9090
+    try:
+        # 31-byte public key: valid base64, wrong length.
+        bad_pubkey = bytes(range(31))
+        value_bytes = b"some value"
+        message = (
+            STORE_DOMAIN_SEPARATOR
+            + str(key).encode()
+            + b"\0"
+            + str(time.time_ns()).encode()
+            + b"\0"
+            + value_bytes
+        )
+        signature = owner.sign(message)
+        seq = time.time_ns()
+        payload = (
+            f"STOR {key} {seq} "
+            f"{base64.b64encode(value_bytes).decode()} "
+            f"{base64.b64encode(bad_pubkey).decode()} "
+            f"{base64.b64encode(signature).decode()}"
+        ).encode()
+        assert await rpc(node.port, payload) == b"REJECTED"
+        assert node.data == {}
+
+        # The connection is still alive: a PING gets a PONG.
+        reader, writer = await asyncio.open_connection(IP, node.port)
+        writer.write(len(b"PING").to_bytes(4, "big") + b"PING")
+        await writer.drain()
+        length = int.from_bytes(await reader.readexactly(4), "big")
+        assert await reader.readexactly(length) == b"PONG"
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_disconnects_stalling_client():
+    """A client that declares a length and sends part of the body is
+    disconnected within READ_TIMEOUT."""
+    import kademlia_dht
+
+    old_timeout = kademlia_dht.READ_TIMEOUT
+    kademlia_dht.READ_TIMEOUT = 0.5
+    node = KademliaNode(1, IP, 0)
+    server = await start_node(node)
+    try:
+        reader, writer = await asyncio.open_connection(IP, node.port)
+        # Declare a 1000-byte body but send only 10 bytes, then stall.
+        writer.write((1000).to_bytes(4, "big") + b"1234567890")
+        await writer.drain()
+        start = time.monotonic()
+        data = await reader.read()
+        elapsed = time.monotonic() - start
+        assert data == b"", "server should close the connection on timeout"
+        assert elapsed < 3.0, f"disconnect took {elapsed:.2f}s, too slow"
+    finally:
+        kademlia_dht.READ_TIMEOUT = old_timeout
         server.close()
         await server.wait_closed()
