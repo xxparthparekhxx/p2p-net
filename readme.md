@@ -128,7 +128,11 @@ NAT traversal is planned but not yet implemented. The Introduction Server exists
   is no global registry: ownership is independent on each node,
   whoever stores a name first on that node becomes its owner there. Replication
   carries the original owner's signature and seq unchanged; a node never
-  re-signs someone else's record with its own key.
+  re-signs someone else's record with its own key. Because names are bound to
+  that key, a node keeps its Ed25519 signing key across restarts in
+  `~/.p2p-net/node_<port>.key` (override with the `key_path` argument or the
+  `P2P_NET_KEY_DIR` directory). The file is created with mode 0600; a node
+  that loses it can no longer update the names it registered.
 - **Resilience:** Planned — the protocol is designed to handle malicious nodes by incorporating redundancy and cryptographic verification.
 
 ## **Future Work**

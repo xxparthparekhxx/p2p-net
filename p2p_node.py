@@ -8,11 +8,13 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from kademlia_dht import KademliaNode, sha1_hash, Node
 
 class P2PNode:
-    def __init__(self, ip: str, port: int):
+    def __init__(self, ip: str, port: int, key_path: Optional[str] = None):
         self.ip = ip
         self.port = port
         self.id = sha1_hash(f"{ip}:{port}")
-        self.kademlia = KademliaNode(self.id, ip, port)
+        # The signing key persists in key_path (default
+        # ~/.p2p-net/node_<port>.key) so this node keeps its names on restart.
+        self.kademlia = KademliaNode(self.id, ip, port, key_path=key_path)
         self.virtual_ip = None
 
     async def join_network(self, intro_server_address: tuple[str, int]):

@@ -2,13 +2,20 @@ import asyncio
 import base64
 import json
 import hashlib
+import os
 import time
 from typing import List, Tuple, Dict, NamedTuple, Optional, Union
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    PublicFormat,
+    load_pem_private_key,
+)
 from cryptography.exceptions import InvalidSignature
 
 K = 20  # k-bucket size
@@ -33,6 +40,58 @@ STORE_DOMAIN_SEPARATOR = b"p2p-net/STORE/v1\0"
 
 ED25519_PUBLIC_KEY_SIZE = 32
 ED25519_SIGNATURE_SIZE = 64
+
+# A node's long-term signing key lives in <key dir>/node_<port>.key unless a
+# key_path is passed explicitly. The directory comes from P2P_NET_KEY_DIR
+# (one directory, so several nodes in one process keep separate keys).
+KEY_DIR_ENV = "P2P_NET_KEY_DIR"
+DEFAULT_KEY_DIR = "~/.p2p-net"
+
+
+def default_key_path(port: int) -> str:
+    key_dir = os.environ.get(KEY_DIR_ENV) or DEFAULT_KEY_DIR
+    return os.path.join(os.path.expanduser(key_dir), f"node_{port}.key")
+
+
+def load_or_create_signing_key(path: str) -> Ed25519PrivateKey:
+    """Load the Ed25519 key in `path` (PEM, PKCS#8), or create it.
+
+    Names are bound to the signer's public key on every node that stores
+    them, so a node must keep its key across restarts to keep updating its
+    names. A new key file is created with os.open(..., O_EXCL, 0o600) so it
+    is never readable by other users, not even briefly. An existing file
+    that doesn't hold a valid key raises instead of being replaced, since
+    replacing it would silently give up ownership of every name.
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        key = Ed25519PrivateKey.generate()
+        pem = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+        os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            # Another process created it first: use that key.
+            return load_or_create_signing_key(path)
+        with os.fdopen(fd, "wb") as f:
+            f.write(pem)
+            f.flush()
+            os.fsync(f.fileno())
+        print(f"Generated a new signing key in {path}")
+        return key
+
+    try:
+        key = load_pem_private_key(data, password=None)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"Key file {path} is not a usable private key: {e}")
+    if not isinstance(key, Ed25519PrivateKey):
+        raise ValueError(f"Key file {path} does not hold an Ed25519 key")
+    if os.stat(path).st_mode & 0o077:
+        print(f"Warning: key file {path} is accessible to other users; "
+              f"run chmod 600 on it")
+    return key
 
 
 def sha1_hash(data: str) -> int:
@@ -402,7 +461,8 @@ class KademliaProtocol:
 
 
 class KademliaNode:
-    def __init__(self, id: int, ip: str, port: int):
+    def __init__(self, id: int, ip: str, port: int,
+                 key_path: Optional[str] = None):
         self.id = id
         self.ip = ip
         self.port = port
@@ -414,8 +474,11 @@ class KademliaNode:
         # no state is saved. The signature is the owner's signature over
         # record_message(key, seq, value), so any copy can be re-verified.
         self.data: Dict[int, Tuple[bytes, int, str, bytes]] = {}
-        # Long-term signing key used to sign records this node stores.
-        self.signing_key = Ed25519PrivateKey.generate()
+        # Long-term signing key used to sign records this node stores. It is
+        # loaded from (or created in) key_path so it survives restarts: other
+        # nodes bind this node's names to it on first use.
+        self.key_path = key_path or default_key_path(port)
+        self.signing_key = load_or_create_signing_key(self.key_path)
         # This node's own public key, the owner recorded for names it stores.
         self.owner_public_key = self.signing_key.public_key().public_bytes(
             Encoding.Raw, PublicFormat.Raw

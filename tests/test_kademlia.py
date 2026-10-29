@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import json
+import os
+import stat
 import time
 
 import pytest
@@ -25,6 +27,14 @@ from kademlia_dht import (
 )
 
 IP = "127.0.0.1"
+
+
+@pytest.fixture(autouse=True)
+def isolated_key_dir(tmp_path, monkeypatch):
+    """Nodes persist their signing key; keep every key file (and any ~
+    expansion) inside this test's tmp_path, never the real home dir."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("P2P_NET_KEY_DIR", str(tmp_path / "keys"))
 
 
 async def start_node(node):
@@ -802,3 +812,71 @@ async def test_bad_node_lists_in_lookup_replies_are_ignored():
         await client.find_node(key)  # must not raise
     finally:
         await close_all(servers)
+
+
+# --- Persistent signing key ---
+
+
+@pytest.mark.asyncio
+async def test_restarted_node_with_same_key_file_can_update_its_name(tmp_path):
+    """A node restarted with the same key file keeps its identity and can
+    still update a name it registered; a node with a new key cannot."""
+    key_path = tmp_path / "owner" / "node.key"
+    peer = KademliaNode(2, IP, 0, key_path=str(tmp_path / "peer.key"))
+    server = await start_node(peer)
+    key = 9000
+    try:
+        owner = KademliaNode(1, IP, 0, key_path=str(key_path))
+        assert stat.S_IMODE(os.stat(key_path).st_mode) == 0o600
+        owner.routing_table.add(Node(peer.id, IP, peer.port))
+        await owner.store(key, "10.0.0.1")
+        assert peer.data[key][0] == owner.owner_public_key
+        assert peer.data[key][2] == "10.0.0.1"
+
+        # "Restart": a fresh node object loads the same key file.
+        restarted = KademliaNode(1, IP, 0, key_path=str(key_path))
+        assert restarted.owner_public_key == owner.owner_public_key
+        restarted.routing_table.add(Node(peer.id, IP, peer.port))
+        await restarted.store(key, "10.0.0.2")
+        assert peer.data[key][2] == "10.0.0.2"
+        value, _ = await restarted.find_value(
+            key, expected_owner=restarted.owner_public_key
+        )
+        assert value == "10.0.0.2"
+
+        # Without the key file (a new key), the update is refused.
+        new_identity = KademliaNode(1, IP, 0, key_path=str(tmp_path / "new.key"))
+        assert new_identity.owner_public_key != owner.owner_public_key
+        new_identity.routing_table.add(Node(peer.id, IP, peer.port))
+        await new_identity.store(key, "10.0.0.3")
+        assert peer.data[key][2] == "10.0.0.2"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+def test_key_file_default_location_and_permissions(tmp_path, monkeypatch):
+    """Without key_path the key goes to $P2P_NET_KEY_DIR/node_<port>.key, or
+    ~/.p2p-net/node_<port>.key if unset; files are 0600, new dirs 0700."""
+    node = KademliaNode(1, IP, 4242)
+    expected = tmp_path / "keys" / "node_4242.key"
+    assert node.key_path == str(expected)
+    assert stat.S_IMODE(os.stat(expected).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(expected.parent).st_mode) == 0o700
+    assert KademliaNode(1, IP, 4242).owner_public_key == node.owner_public_key
+
+    monkeypatch.delenv("P2P_NET_KEY_DIR")
+    node = KademliaNode(1, IP, 4243)
+    # HOME is tmp_path/home (see the isolated_key_dir fixture).
+    assert node.key_path == str(tmp_path / "home" / ".p2p-net" / "node_4243.key")
+    assert os.path.exists(node.key_path)
+
+
+def test_unreadable_key_file_is_not_replaced(tmp_path):
+    """A key file that doesn't hold a valid key raises instead of being
+    overwritten with a new key (which would give up every name)."""
+    bad = tmp_path / "bad.key"
+    bad.write_bytes(b"not a key")
+    with pytest.raises(ValueError):
+        KademliaNode(1, IP, 0, key_path=str(bad))
+    assert bad.read_bytes() == b"not a key"
