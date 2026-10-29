@@ -5,7 +5,12 @@ import base64
 from typing import Optional
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from kademlia_dht import KademliaNode, sha1_hash, Node
+from kademlia_dht import KademliaNode, sha1_hash, Node, connect
+
+
+class IntroductionServerUnreachable(ConnectionError):
+    """join_network could not connect to the introduction server."""
+
 
 class P2PNode:
     def __init__(self, ip: str, port: int, key_path: Optional[str] = None):
@@ -18,9 +23,16 @@ class P2PNode:
         self.virtual_ip = None
 
     async def join_network(self, intro_server_address: tuple[str, int]):
+        host, port = intro_server_address
         try:
-            reader, writer = await asyncio.open_connection(*intro_server_address)
+            reader, writer = await connect(host, port)
+        except OSError as e:  # refused, unresolvable, or timed out
+            raise IntroductionServerUnreachable(
+                f"Can't reach the introduction server at {host}:{port} ({e}); "
+                f"is it running? Start it with: python introduction_server.py"
+            ) from e
 
+        try:
             # Send our listening address and port to the introduction server
             peer_info = {
                 'listening_ip': self.ip,
@@ -113,8 +125,15 @@ async def main():
     run_tasks = [asyncio.create_task(node.run()) for node in nodes]
 
     # Join the network
-    join_tasks = [node.join_network(('localhost', 8888)) for node in nodes]
-    await asyncio.gather(*join_tasks)
+    join_tasks = [node.join_network(('127.0.0.1', 8888)) for node in nodes]
+    try:
+        await asyncio.gather(*join_tasks)
+    except IntroductionServerUnreachable as e:
+        print(f"Error: {e}")
+        for task in run_tasks:
+            task.cancel()
+        await asyncio.gather(*run_tasks, return_exceptions=True)
+        return
     print("All nodes have joined the network")
 
     # Wait for the network to stabilize
