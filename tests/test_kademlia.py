@@ -1,6 +1,11 @@
 import asyncio
+import base64
+import json
 
 import pytest
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from kademlia_dht import KademliaNode, Node, KBucket, K
 
@@ -111,3 +116,48 @@ def test_routing_table_add_refreshes_bucket():
     table.buckets[bucket_index].nodes = [n1]
     assert table.buckets[bucket_index].add(Node(2, IP, 2)) is True
     assert table.buckets[bucket_index].nodes == [n1]
+
+
+def make_store_payload(signing_key, key, value):
+    """Build a signed STOR payload the same way KademliaProtocol.store does."""
+    public_key_bytes = signing_key.public_key().public_bytes(
+        Encoding.Raw, PublicFormat.Raw
+    )
+    signature = signing_key.sign(f"{key} {value}".encode())
+    return (
+        f"STOR {key} {value} "
+        f"{base64.b64encode(public_key_bytes).decode()} "
+        f"{base64.b64encode(signature).decode()}"
+    ).encode()
+
+
+async def rpc(port, payload):
+    """Send one length-prefixed message and read one framed reply."""
+    reader, writer = await asyncio.open_connection(IP, port)
+    writer.write(len(payload).to_bytes(4, "big") + payload)
+    await writer.drain()
+    length = int.from_bytes(await reader.readexactly(4), "big")
+    response = await reader.readexactly(length)
+    writer.close()
+    await writer.wait_closed()
+    return response
+
+
+@pytest.mark.asyncio
+async def test_store_accepts_values_with_spaces():
+    """Regression: values with spaces ("hello world") are stored verbatim."""
+    node = KademliaNode(1, IP, 0)
+    server = await start_node(node)
+    owner = Ed25519PrivateKey.generate()
+    key = 777
+    try:
+        assert await rpc(
+            node.port, make_store_payload(owner, key, "hello world")
+        ) == b"OK"
+        assert node.data[key] == "hello world"
+
+        reply = await rpc(node.port, f"FIND_VALUE {key}".encode())
+        assert json.loads(reply.decode())['value'] == "hello world"
+    finally:
+        server.close()
+        await server.wait_closed()

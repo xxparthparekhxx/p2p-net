@@ -123,13 +123,17 @@ class KademliaProtocol:
 
     async def handle_store(self, writer, payload: bytes):
         # payload: b"STOR <key> <value> <base64 public_key> <base64 signature>"
-        parts = payload.decode().split(maxsplit=4)
-        if len(parts) != 5:
-            print("Rejecting malformed STORE: missing fields")
+        # Base64 fields never contain spaces but values can, so split the two
+        # trailing fields off the right and keep everything between the key
+        # and them as the value (e.g. "hello world").
+        try:
+            head, public_key_b64, signature_b64 = payload.decode().rsplit(maxsplit=2)
+            _, key_s, value = head.split(maxsplit=2)
+            key = int(key_s)
+        except ValueError:
+            print("Rejecting malformed STORE: missing or invalid fields")
             await self._send_message(writer, b"REJECTED")
             return
-        _, key_s, value, public_key_b64, signature_b64 = parts
-        key = int(key_s)
 
         try:
             public_key_bytes = base64.b64decode(public_key_b64)
