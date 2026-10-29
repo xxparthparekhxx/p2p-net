@@ -3,6 +3,7 @@ import base64
 import itertools
 import json
 import os
+import socket
 import stat
 import time
 
@@ -17,6 +18,7 @@ from kademlia_dht import (
     KBucket,
     K,
     RoutingTable,
+    CONNECT_TIMEOUT,
     ID_BITS,
     MAX_LOOKUP_QUERIES,
     MAX_MESSAGE_SIZE,
@@ -992,3 +994,72 @@ def test_key_write_goes_through_a_private_temp_file(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "replace", spy)
     KademliaNode(1, IP, 0, key_path=str(key_path))
     assert seen == [(str(key_path.parent), 0o600, False, str(key_path))]
+
+
+# --- Connect timeout ---
+
+
+def blackhole_listener():
+    """A 127.0.0.1 listener whose accept queue is full and never drained.
+
+    On Linux further SYNs to it are dropped, so a connect() to it hangs (SYN
+    retries for about two minutes) instead of being refused: a stand-in for
+    an unreachable contact. Returns (port, sockets to close).
+    """
+    listener = socket.socket()
+    listener.bind((IP, 0))
+    listener.listen(0)
+    port = listener.getsockname()[1]
+    sockets = [listener]
+    for _ in range(4):
+        filler = socket.socket()
+        filler.setblocking(False)
+        try:
+            filler.connect((IP, port))
+        except BlockingIOError:
+            pass
+        sockets.append(filler)
+    return port, sockets
+
+
+def test_connect_timeout_default():
+    assert CONNECT_TIMEOUT == 5
+
+
+@pytest.mark.asyncio
+async def test_unreachable_contact_does_not_stall_a_lookup(monkeypatch):
+    """A contact whose connect() hangs costs at most CONNECT_TIMEOUT: the
+    lookup still returns the honest replica's value right after it, and
+    find_node returns too, instead of waiting out the OS connect timeout."""
+    import kademlia_dht
+    monkeypatch.setattr(kademlia_dht, "CONNECT_TIMEOUT", 0.5)
+    key = 11000
+    owner = Ed25519PrivateKey.generate()
+    honest = make_node(11003)
+    server = await start_node(honest)
+    dead_port, sockets = blackhole_listener()
+    try:
+        await asyncio.sleep(0.1)  # let the fillers occupy the accept queue
+        # Without the timeout this connect would hang for minutes.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(kademlia_dht.connect(IP, dead_port), 5)
+
+        assert await rpc(honest.port, make_store_payload(owner, key, "10.0.0.1")[0]) == b"OK"
+        client = make_node(7)
+        client.routing_table.add(Node(11001, IP, dead_port))  # closest, dead
+        client.routing_table.add(Node(honest.id, IP, honest.port))
+
+        start = time.monotonic()
+        value, _ = await asyncio.wait_for(client.find_value(key), 10)
+        elapsed = time.monotonic() - start
+        assert value == "10.0.0.1"
+        assert elapsed < 0.5 + 1.0, f"lookup took {elapsed:.2f}s"
+
+        start = time.monotonic()
+        await asyncio.wait_for(client.find_node(key), 10)
+        assert time.monotonic() - start < 0.5 + 1.0
+    finally:
+        for sock in sockets:
+            sock.close()
+        server.close()
+        await server.wait_closed()

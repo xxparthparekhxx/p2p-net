@@ -39,6 +39,11 @@ MAX_MESSAGE_SIZE = 1024 * 1024  # 1 MB
 # without this, so every framed read is wrapped in wait_for(READ_TIMEOUT).
 READ_TIMEOUT = 10
 
+# Connect timeout (seconds) for every outgoing TCP connection. A contact that
+# drops SYNs would otherwise hold up its whole lookup round until the OS gives
+# up (about two minutes on Linux), so connections go through connect().
+CONNECT_TIMEOUT = 5
+
 # Domain separator for signed STORE records. Covers key, sequence number and
 # value so an old signed STORE cannot be replayed to roll a record back.
 STORE_DOMAIN_SEPARATOR = b"p2p-net/STORE/v1\0"
@@ -144,6 +149,21 @@ def load_or_create_signing_key(path: str) -> Ed25519PrivateKey:
         print(f"Warning: key file {path} is accessible to other users; "
               f"run chmod 600 on it")
     return key
+
+
+async def connect(ip: str, port: int):
+    """asyncio.open_connection bounded by CONNECT_TIMEOUT (read at call time).
+
+    Raises TimeoutError (an OSError) if the connection isn't up in time.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.open_connection(ip, port), CONNECT_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"connecting to {ip}:{port} timed out after {CONNECT_TIMEOUT}s"
+        ) from None
 
 
 def sha1_hash(data: str) -> int:
@@ -547,7 +567,7 @@ class KademliaNode:
 
     async def ping(self, node: Node):
         try:
-            reader, writer = await asyncio.open_connection(node.ip, node.port)
+            reader, writer = await connect(node.ip, node.port)
             await self.protocol.ping(writer)
             response = await self.protocol._read_message(reader)
             if response == b"PONG":
@@ -584,7 +604,7 @@ class KademliaNode:
     async def _store_on_node(self, node: Node, key: int, value: str, seq: int,
                              signature: bytes = None):
         try:
-            reader, writer = await asyncio.open_connection(node.ip, node.port)
+            reader, writer = await connect(node.ip, node.port)
             await self.protocol.store(writer, key, value, seq, signature)
             response = await self.protocol._read_message(reader)
             if response == b"OK":
@@ -617,7 +637,7 @@ class KademliaNode:
 
     async def _find_node_on_node(self, node: Node, target_id: int) -> List[Node]:
         try:
-            reader, writer = await asyncio.open_connection(node.ip, node.port)
+            reader, writer = await connect(node.ip, node.port)
             await self.protocol.find_node(writer, target_id)
             response = await self.protocol._read_message(reader)
             writer.close()
@@ -686,7 +706,7 @@ class KademliaNode:
         self, node: Node, key: int, expected_owner: Optional[bytes] = None
     ) -> Union[VerifiedRecord, List[Node], None]:
         try:
-            reader, writer = await asyncio.open_connection(node.ip, node.port)
+            reader, writer = await connect(node.ip, node.port)
             try:
                 await self.protocol.find_value(writer, key)
                 response = await self.protocol._read_message(reader)
