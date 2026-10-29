@@ -256,6 +256,9 @@ class KademliaProtocol:
             key = int(key_s)
             seq = int(seq_s)
             value_bytes = base64.b64decode(value_b64)
+            # Values are UTF-8 text; anything else is rejected here rather
+            # than raising later and dropping the connection without a reply.
+            value = value_bytes.decode()
             public_key_bytes = base64.b64decode(public_key_b64)
             signature = base64.b64decode(signature_b64)
         except Exception:
@@ -283,7 +286,6 @@ class KademliaProtocol:
         # but only with a strictly greater sequence number (an equal seq with
         # the identical value is an idempotent no-op). The signature is kept
         # with the record so FIND_VALUE can hand out a self-verifying record.
-        value = value_bytes.decode()
         record = self.kademlia_node.data.get(key)
         if record is None:
             self.kademlia_node.data[key] = (public_key_bytes, seq, value, signature)

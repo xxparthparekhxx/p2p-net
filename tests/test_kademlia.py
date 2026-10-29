@@ -704,3 +704,25 @@ async def test_find_value_keeps_searching_after_a_stale_hit():
         assert value == "10.0.0.2"
     finally:
         await close_all(servers)
+
+
+@pytest.mark.asyncio
+async def test_non_utf8_value_is_rejected_and_server_keeps_serving():
+    """A correctly signed STORE whose value isn't UTF-8 gets REJECTED instead
+    of dropping the connection, and the node keeps serving."""
+    node = KademliaNode(1, IP, 0)
+    server = await start_node(node)
+    owner = Ed25519PrivateKey.generate()
+    key = 6000
+    try:
+        payload, _ = make_store_payload(owner, key, b"\xff\xfe\x80 not utf-8")
+        assert await rpc(node.port, payload) == b"REJECTED"
+        assert node.data == {}
+
+        assert await rpc(node.port, b"PING") == b"PONG"
+        assert await rpc(node.port, make_store_payload(owner, key, "10.0.0.1")[0]) == b"OK"
+        reply = json.loads((await rpc(node.port, f"FIND_VALUE {key}".encode())).decode())
+        assert parse_record_reply(key, reply).value == "10.0.0.1"
+    finally:
+        server.close()
+        await server.wait_closed()
