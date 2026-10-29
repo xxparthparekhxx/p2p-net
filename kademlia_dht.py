@@ -34,6 +34,11 @@ MAX_LOOKUP_QUERIES = 4 * K
 # arbitrarily large buffer; larger messages are rejected.
 MAX_MESSAGE_SIZE = 1024 * 1024  # 1 MB
 
+# Largest value a STORE may carry, in UTF-8 bytes. FIND_VALUE replies carry
+# the value base64-encoded (4/3 the size) plus a few hundred bytes of JSON,
+# so every record a node accepts also fits in one MAX_MESSAGE_SIZE reply.
+MAX_VALUE_SIZE = 512 * 1024
+
 # Read timeout (seconds) for the header and body of a single framed message.
 # A client that declares a length and then stalls holds the handler forever
 # without this, so every framed read is wrapped in wait_for(READ_TIMEOUT).
@@ -218,14 +223,18 @@ def valid_seq(seq) -> bool:
     return _is_int(seq) and 0 <= seq < SEQ_LIMIT
 
 
-def _b64_field(reply: dict, name: str, size: int) -> bytes:
+def _b64_decode(reply: dict, name: str) -> bytes:
     raw = reply[name]
     if not isinstance(raw, str):
         raise ValueError(f"{name} is not a base64 string")
     try:
-        decoded = base64.b64decode(raw, validate=True)
+        return base64.b64decode(raw, validate=True)
     except ValueError:
         raise ValueError(f"{name} is not valid base64")
+
+
+def _b64_field(reply: dict, name: str, size: int) -> bytes:
+    decoded = _b64_decode(reply, name)
     if len(decoded) != size:
         raise ValueError(f"{name} is {len(decoded)} bytes, expected {size}")
     return decoded
@@ -234,10 +243,11 @@ def _b64_field(reply: dict, name: str, size: int) -> bytes:
 def parse_record_reply(key: int, reply) -> VerifiedRecord:
     """Check a FIND_VALUE record reply for `key` and return it verified.
 
-    The reply carries the whole signed record (key, seq, value, owner public
-    key, signature), so the signed message is rebuilt from it and checked
-    against the claimed owner. Raises ValueError if anything is missing,
-    malformed, for a different key, or the signature does not verify.
+    The reply carries the whole signed record (key, seq, base64 value, owner
+    public key, signature), so the signed message is rebuilt from it and
+    checked against the claimed owner. Raises ValueError if anything is
+    missing, malformed, for a different key, or the signature does not
+    verify.
     """
     if not isinstance(reply, dict):
         raise ValueError("reply is not a JSON object")
@@ -245,19 +255,23 @@ def parse_record_reply(key: int, reply) -> VerifiedRecord:
                if f not in reply]
     if missing:
         raise ValueError(f"missing fields: {', '.join(missing)}")
-    reply_key, seq, value = reply["key"], reply["seq"], reply["value"]
+    reply_key, seq = reply["key"], reply["seq"]
     if not _is_int(reply_key) or reply_key != key:
         raise ValueError("record is for a different key")
     if not valid_seq(seq):
         raise ValueError("seq is not an unsigned 64-bit integer")
-    if not isinstance(value, str):
-        raise ValueError("value is not a string")
+    # The value travels base64-encoded, like every other binary field: as a
+    # JSON string, control characters escape to six bytes each, which could
+    # push a reply for a valid record past MAX_MESSAGE_SIZE.
+    value_bytes = _b64_decode(reply, "value")
+    if len(value_bytes) > MAX_VALUE_SIZE:
+        raise ValueError(f"value is over {MAX_VALUE_SIZE} bytes")
+    try:
+        value = value_bytes.decode()
+    except UnicodeDecodeError:
+        raise ValueError("value is not UTF-8 text")
     owner = _b64_field(reply, "owner", ED25519_PUBLIC_KEY_SIZE)
     signature = _b64_field(reply, "signature", ED25519_SIGNATURE_SIZE)
-    try:
-        value_bytes = value.encode()
-    except UnicodeEncodeError:
-        raise ValueError("value is not valid text")
     if not verify_record(reply_key, seq, value_bytes, owner, signature):
         raise ValueError("signature does not verify for the claimed owner")
     return VerifiedRecord(value, seq, owner, signature)
@@ -431,6 +445,12 @@ class KademliaProtocol:
             await self._send_message(writer, b"REJECTED")
             return
 
+        if len(value_bytes) > MAX_VALUE_SIZE:
+            print(f"Rejecting STORE: value for key {key} is "
+                  f"{len(value_bytes)} bytes, over {MAX_VALUE_SIZE}")
+            await self._send_message(writer, b"REJECTED")
+            return
+
         if not valid_seq(seq):
             print(f"Rejecting STORE: seq for key {key} is not an unsigned "
                   f"64-bit integer")
@@ -503,11 +523,13 @@ class KademliaProtocol:
         if key in self.kademlia_node.data:
             # Return the whole signed record (key, seq, value, owner public
             # key and signature) so the caller can verify it on its own; this
-            # node is not trusted to vouch for it.
+            # node is not trusted to vouch for it. The value is base64, like
+            # the other binary fields, so its size on the wire is 4/3 of the
+            # value however many control characters it holds.
             owner, seq, value, signature = self.kademlia_node.data[key]
             response = json.dumps({
                 'key': key,
-                'value': value,
+                'value': base64.b64encode(value.encode()).decode(),
                 'seq': seq,
                 'owner': base64.b64encode(owner).decode(),
                 'signature': base64.b64encode(signature).decode(),
@@ -600,8 +622,12 @@ class KademliaNode:
         # One seq and one signature for this store op, carried unchanged to
         # the local copy and every replica so the record is identical (and
         # verifiable) wherever it is stored.
+        value_bytes = value.encode()
+        if len(value_bytes) > MAX_VALUE_SIZE:
+            raise ValueError(f"value is {len(value_bytes)} bytes; the limit "
+                             f"is MAX_VALUE_SIZE = {MAX_VALUE_SIZE}")
         seq = time.time_ns()
-        signature = self.sign_record(key, seq, value.encode())
+        signature = self.sign_record(key, seq, value_bytes)
         # This node is a candidate replica too: it is never in its own routing
         # table, so without adding it here the local copy was never written.
         me = Node(self.id, self.ip, self.port)

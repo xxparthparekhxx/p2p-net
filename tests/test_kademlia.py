@@ -20,6 +20,7 @@ from kademlia_dht import (
     RoutingTable,
     CONNECT_TIMEOUT,
     SEQ_LIMIT,
+    MAX_VALUE_SIZE,
     ID_BITS,
     MAX_LOOKUP_QUERIES,
     MAX_MESSAGE_SIZE,
@@ -273,7 +274,7 @@ async def test_find_value_returns_owner_key():
         await rpc(node.port, payload)
         reply = await rpc(node.port, f"FIND_VALUE {key}".encode())
         result = json.loads(reply.decode())
-        assert result['value'] == "10.0.0.7"
+        assert base64.b64decode(result['value']) == b"10.0.0.7"
         assert result['seq'] == seq
         expected_owner = owner.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         assert base64.b64decode(result['owner']) == expected_owner
@@ -300,7 +301,7 @@ async def test_store_accepts_values_with_spaces():
         )
 
         reply = await rpc(node.port, f"FIND_VALUE {key}".encode())
-        assert json.loads(reply.decode())['value'] == "hello world"
+        assert parse_record_reply(key, json.loads(reply.decode())).value == "hello world"
     finally:
         server.close()
         await server.wait_closed()
@@ -319,7 +320,7 @@ async def test_store_values_round_trip_exactly():
             assert await rpc(node.port, payload) == b"OK", value
             assert node.data[key][2] == value, value
             reply = await rpc(node.port, f"FIND_VALUE {key}".encode())
-            assert json.loads(reply.decode())['value'] == value, value
+            assert parse_record_reply(key, json.loads(reply.decode())).value == value, value
     finally:
         server.close()
         await server.wait_closed()
@@ -470,7 +471,7 @@ def signed_reply(signer, key, seq, value, owner=None, **overrides):
     reply = {
         'key': key,
         'seq': seq,
-        'value': value,
+        'value': b64(value.encode()),
         'owner': b64(owner if owner is not None else pub(signer)),
         'signature': b64(signature),
     }
@@ -642,7 +643,9 @@ async def test_unverifiable_replies_count_as_no_answer():
         json.dumps({**good, 'value': 12345}).encode(),
         json.dumps({**good, 'value': "\ud800"}).encode(),  # lone surrogate
         json.dumps({**good, 'seq': seq + 1}).encode(),
-        json.dumps({**good, 'value': "10.0.0.2"}).encode(),
+        json.dumps({**good, 'value': b64(b"10.0.0.2")}).encode(),
+        json.dumps({**good, 'value': "10.0.0.1"}).encode(),  # not base64
+        json.dumps({**good, 'value': b64(b"\xff\xfe")}).encode(),  # not UTF-8
         b"not json",
         b"\xff\xfe",
         b"[" * 100000,  # deeply nested: RecursionError in json
@@ -1160,3 +1163,49 @@ async def test_reply_with_seq_outside_uint64_is_rejected():
         assert parse_record_reply(key, top).seq == 2 ** 64 - 1
     finally:
         await close_all(servers)
+
+
+# --- Value size and FIND_VALUE encoding ---
+
+
+@pytest.mark.asyncio
+async def test_large_binary_value_round_trips_and_oversize_is_rejected():
+    """A MAX_VALUE_SIZE value of control characters (each would be a 6-byte
+    \\uXXXX escape as a JSON string) round-trips through STORE and
+    FIND_VALUE within the frame cap, because the reply carries the value
+    base64-encoded; one byte over MAX_VALUE_SIZE is REJECTED."""
+    assert MAX_VALUE_SIZE == 512 * 1024
+    value = ("\x01\x00\x1b\x7f" * (MAX_VALUE_SIZE // 4 - 2)) + "\x01\x02é\U0001f600"
+    assert len(value.encode()) == MAX_VALUE_SIZE
+    assert len(json.dumps(value)) > MAX_MESSAGE_SIZE  # as a JSON string
+    key = 14000
+    writer_node = make_node(1)
+    replica = make_node(2)
+    server = await start_node(replica)
+    try:
+        writer_node.routing_table.add(Node(replica.id, IP, replica.port))
+        await writer_node.store(key, value)
+        assert replica.data[key][2] == value
+
+        raw = await rpc(replica.port, f"FIND_VALUE {key}".encode())
+        assert len(raw) < MAX_MESSAGE_SIZE
+        assert len(raw) < MAX_VALUE_SIZE * 4 // 3 + 1024
+
+        client = make_node(7)
+        client.routing_table.add(Node(replica.id, IP, replica.port))
+        found, _ = await client.find_value(key)
+        assert found == value
+
+        # One byte over the cap: REJECTED on the wire, refused by store().
+        owner = Ed25519PrivateKey.generate()
+        too_big = "\x01" * (MAX_VALUE_SIZE + 1)
+        payload, _ = make_store_payload(owner, key + 1, too_big)
+        assert len(payload) < MAX_MESSAGE_SIZE
+        assert await rpc(replica.port, payload) == b"REJECTED"
+        assert key + 1 not in replica.data
+        with pytest.raises(ValueError, match="MAX_VALUE_SIZE"):
+            await writer_node.store(key + 1, too_big)
+        assert key + 1 not in writer_node.data
+    finally:
+        server.close()
+        await server.wait_closed()
