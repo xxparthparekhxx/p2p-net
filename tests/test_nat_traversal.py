@@ -973,19 +973,20 @@ async def test_channel_reconnects_after_the_server_drops_it(tmp_path, monkeypatc
 
 @pytest.mark.asyncio
 async def test_pings_keep_a_quiet_channel_open(tmp_path, monkeypatch):
-    """Between requests the channel carries only pings. With the 10 s
-    per-message READ_TIMEOUT applied to it, it would be torn down and
-    re-opened every time it idled; only silence past RELAY_IDLE_TIMEOUT
-    closes it."""
-    monkeypatch.setattr(kademlia_dht, "READ_TIMEOUT", 0.2)
-    monkeypatch.setattr(relay, "RELAY_PING_INTERVAL", 0.1)
-    monkeypatch.setattr(relay, "RELAY_IDLE_TIMEOUT", 0.6)
-    monkeypatch.setattr(introduction_server, "RELAY_IDLE_TIMEOUT", 0.6)
+    """Between requests the channel carries only pings and pongs, further
+    apart than the per-message READ_TIMEOUT. With that timeout applied to
+    the wait for the next message, either end would tear the channel down
+    and it would be re-opened every time it idled; only silence past
+    RELAY_IDLE_TIMEOUT closes it."""
+    monkeypatch.setattr(kademlia_dht, "READ_TIMEOUT", 0.15)
+    monkeypatch.setattr(relay, "RELAY_PING_INTERVAL", 0.4)
+    monkeypatch.setattr(relay, "RELAY_IDLE_TIMEOUT", 1.0)
+    monkeypatch.setattr(introduction_server, "RELAY_IDLE_TIMEOUT", 1.0)
     monkeypatch.setattr(relay, "RELAY_RECONNECT_MIN", 0.1)
     async with Network(tmp_path) as net:
         b = await net.node("b", behind_nat=True)
         first = net.server.relay_channels[b.virtual_ip]
-        await asyncio.sleep(1.5)  # 7x READ_TIMEOUT, 2.5x the idle timeout
+        await asyncio.sleep(2.2)  # 2x the idle timeout, 15x READ_TIMEOUT
         assert net.server.relay_channels[b.virtual_ip] is first
 
 
@@ -1127,6 +1128,7 @@ async def test_channel_client_keeps_retrying_when_registration_is_refused(
 async def test_relay_request_gives_none_for_every_kind_of_failure(monkeypatch):
     monkeypatch.setattr(kademlia_dht, "READ_TIMEOUT", 0.3)
     monkeypatch.setattr(relay, "RELAY_TIMEOUT", 0.2)
+    connections = []
     behaviours = iter([
         lambda r, w: write_frame(w, json.dumps(                  # refused
             {'type': 'relay_failed', 'error': 'nope'}).encode()),
@@ -1136,6 +1138,7 @@ async def test_relay_request_gives_none_for_every_kind_of_failure(monkeypatch):
 
     async def server(reader, writer):
         await reader.read(4096)
+        connections.append(1)
         try:
             await next(behaviours)(reader, writer)
         finally:
@@ -1146,9 +1149,12 @@ async def test_relay_request_gives_none_for_every_kind_of_failure(monkeypatch):
     try:
         for _ in range(3):
             assert await client.request("10.0.0.2", b"PING") is None
-        # A payload over the cap is not even sent.
+        # A payload over the cap is not even sent: no connection is made.
+        assert len(connections) == 3
         assert await client.request(
             "10.0.0.2", b"x" * (MAX_RELAYED_MESSAGE_SIZE + 1)) is None
+        await asyncio.sleep(0.1)
+        assert len(connections) == 3
     finally:
         await close_srv(srv)
     # And with the server gone.
@@ -1174,7 +1180,7 @@ async def test_relay_request_refuses_a_reply_over_the_cap():
         await close_srv(srv)
 
 
-# --- Joining: the join reply ---
+# --- Review fixes: join reply, relay client timing, server edge cases ---
 
 
 async def join_against(tmp_path, script):
@@ -1238,3 +1244,186 @@ async def test_join_reply_over_the_size_cap_is_refused(tmp_path, capsys):
     node = await join_against(tmp_path, server)
     assert node.virtual_ip is None
     assert "join reply is over" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_a_relay_fails_at_once_if_its_destination_re_registers():
+    """The sender is told the relay is ready, then the destination opens a
+    new channel before the payload arrives. The payload goes to neither
+    channel: the relay was set up against the channel that is now gone."""
+    server, srv, port, (a, b) = await relay_setup()
+    old = await ChannelPeer(port, b).open()
+    new = None
+    reader, writer = await asyncio.open_connection(IP, port)
+    try:
+        writer.write(json.dumps({
+            'type': 'relay', 'from': a['virtual_ip'], 'token': a['relay_token'],
+            'to': b['virtual_ip']}).encode())
+        await writer.drain()
+        assert (await read_json_frame(reader))['type'] == 'relay_ready'
+        new = await ChannelPeer(port, b).open()
+        await wait_until(lambda: old._task.done())  # the server closed it
+        await write_frame(writer, b"PING")
+        answer = await read_json_frame(reader)
+        assert answer['type'] == 'relay_failed'
+        assert 'no relay channel' in answer['error']
+        await asyncio.sleep(0.1)
+        assert old.received == [] and new.received == []
+    finally:
+        writer.close()
+        await old.close()
+        if new is not None:
+            await new.close()
+        await close_srv(srv)
+
+
+@pytest.mark.asyncio
+async def test_releasing_a_virtual_ip_forgets_its_relay_rate(monkeypatch):
+    """The next peer to get the address starts with a clean count."""
+    monkeypatch.setattr(introduction_server, "RELAY_RATE_LIMIT", 2)
+    server, srv, port, (a, b) = await relay_setup()
+    try:
+        for _ in range(2):
+            frames = await relay_request(port, a, b['virtual_ip'], b"PING")
+            assert 'no relay channel' in frames[-1]['error']
+        frames = await relay_request(port, a, b['virtual_ip'], b"PING")
+        assert 'rate limit' in frames[-1]['error']
+
+        server.release_virtual_ip(a['virtual_ip'])
+        a2 = await raw_join(port, IP, dead_port())
+        assert a2['virtual_ip'] == a['virtual_ip']
+        frames = await relay_request(port, a2, b['virtual_ip'], b"PING")
+        assert 'no relay channel' in frames[-1]['error']
+    finally:
+        await close_srv(srv)
+
+
+def connection_times_server(on_connection):
+    """A scripted-server script that notes when each connection arrives (on
+    the loop's clock) and then runs on_connection(reader, writer)."""
+    times = []
+
+    async def script(reader, writer):
+        await reader.read(4096)
+        times.append(asyncio.get_running_loop().time())
+        try:
+            await on_connection(reader, writer)
+        finally:
+            writer.close()
+
+    return times, script
+
+
+def gaps(times):
+    return [later - earlier for earlier, later in zip(times, times[1:])]
+
+
+async def no_handler(payload):
+    return None
+
+
+@pytest.mark.asyncio
+async def test_channel_reconnect_delay_doubles_up_to_the_maximum(monkeypatch):
+    monkeypatch.setattr(relay, "RELAY_RECONNECT_MIN", 0.05)
+    monkeypatch.setattr(relay, "RELAY_RECONNECT_MAX", 0.2)
+    monkeypatch.setattr(relay, "RELAY_REGISTER_WAIT", 0.1)
+
+    async def refuse(reader, writer):
+        pass  # hang up without registering
+
+    times, script = connection_times_server(refuse)
+    srv, port = await scripted_server(script)
+    client = RelayClient((IP, port), "10.0.0.1", "tok", no_handler)
+    try:
+        await client.start()
+        await wait_until(lambda: len(times) >= 7, tries=400)
+    finally:
+        await client.stop()
+        await close_srv(srv)
+    delays = gaps(times)[:5]   # 0.05, 0.1, 0.2, 0.2, 0.2
+    assert delays[0] < 0.1      # starts at the minimum
+    assert delays[2] >= 0.19    # has doubled up to the maximum
+    assert max(delays) < 0.35   # and stays there
+
+
+@pytest.mark.asyncio
+async def test_channel_reconnect_delay_resets_after_a_registration(monkeypatch):
+    monkeypatch.setattr(relay, "RELAY_RECONNECT_MIN", 0.05)
+    monkeypatch.setattr(relay, "RELAY_RECONNECT_MAX", 5)
+
+    async def register_then_drop(reader, writer):
+        await write_frame(writer, json.dumps(
+            {'type': 'relay_registered'}).encode())
+
+    times, script = connection_times_server(register_then_drop)
+    srv, port = await scripted_server(script)
+    client = RelayClient((IP, port), "10.0.0.1", "tok", no_handler)
+    try:
+        await client.start()
+        await wait_until(lambda: len(times) >= 7, tries=400)
+    finally:
+        await client.stop()
+        await close_srv(srv)
+    # Every drop follows a good registration, so the delay never grows
+    # (without the reset the 5th gap would be 0.8 s).
+    assert max(gaps(times)[:5]) < 0.3
+
+
+@pytest.mark.asyncio
+async def test_the_client_drops_a_channel_the_server_went_silent_on(
+        monkeypatch):
+    """The client does not wait out the 10 s per-message timeout, or forever:
+    it gives up on a channel that has been silent for RELAY_IDLE_TIMEOUT."""
+    monkeypatch.setattr(relay, "RELAY_IDLE_TIMEOUT", 0.3)
+    monkeypatch.setattr(relay, "RELAY_PING_INTERVAL", 60)  # no pings, no pongs
+    monkeypatch.setattr(relay, "RELAY_RECONNECT_MIN", 0.05)
+
+    async def register_then_go_silent(reader, writer):
+        await write_frame(writer, json.dumps(
+            {'type': 'relay_registered'}).encode())
+        await reader.read()  # until the client hangs up
+
+    times, script = connection_times_server(register_then_go_silent)
+    srv, port = await scripted_server(script)
+    client = RelayClient((IP, port), "10.0.0.1", "tok", no_handler)
+    try:
+        await client.start()
+        await wait_until(lambda: len(times) >= 2)
+    finally:
+        await client.stop()
+        await close_srv(srv)
+
+
+def ping_tasks():
+    return [t for t in asyncio.all_tasks() if not t.done()
+            and t.get_coro().__qualname__ == "RelayClient._ping_loop"]
+
+
+@pytest.mark.asyncio
+async def test_a_channels_ping_task_ends_with_the_channel(tmp_path, monkeypatch):
+    monkeypatch.setattr(relay, "RELAY_PING_INTERVAL", 60)
+    monkeypatch.setattr(relay, "RELAY_RECONNECT_MIN", 0.05)
+    async with Network(tmp_path) as net:
+        b = await net.node("b", behind_nat=True)
+        assert len(ping_tasks()) == 1
+        first = net.server.relay_channels[b.virtual_ip]
+        first.close()
+        await wait_until(lambda: net.server.relay_channels.get(
+            b.virtual_ip) not in (None, first))
+        await wait_until(lambda: len(ping_tasks()) == 1)  # not 2
+        await b.stop()
+        await wait_until(lambda: ping_tasks() == [])
+
+
+@pytest.mark.asyncio
+async def test_joining_again_replaces_the_relay_channel(tmp_path):
+    """join_network stops the previous relay client first, so it does not
+    keep an orphaned channel open (under its old virtual ip)."""
+    async with Network(tmp_path) as net:
+        b = await net.node("b", behind_nat=True)
+        old_vip, old_relay = b.virtual_ip, b.relay
+        await b.join_network((IP, net.port))
+        assert b.virtual_ip != old_vip and b.relay is not old_relay
+        assert old_relay._task is None
+        await wait_until(lambda: list(net.server.relay_channels)
+                         == [b.virtual_ip])
