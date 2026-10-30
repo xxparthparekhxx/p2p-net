@@ -19,6 +19,9 @@ Channel:
   peer -> server   {"type": "relay_reply", "id", "payload": base64}, or
                    {"type": "relay_reply", "id", "error"}
   peer -> server   {"type": "ping"}      server -> peer  {"type": "pong"}
+  A peer that does TCP hole punching opens the channel from its listening
+  port and adds "punch": true to relay_register; the server then also sends
+  it {"type": "punch_go", ...} frames on the channel (see punch.py).
 
 Request:
   peer -> server   {"type": "relay", "from", "token", "to"}
@@ -37,6 +40,7 @@ import base64
 import json
 from typing import Awaitable, Callable, Optional
 
+import kademlia_dht
 from kademlia_dht import (
     MAX_MESSAGE_SIZE,
     READ_TIMEOUT,
@@ -45,6 +49,7 @@ from kademlia_dht import (
     safe_text,
     write_frame,
 )
+from stun import connect_from
 
 # A relayed message is an ordinary framed DHT message and obeys its 1 MB cap,
 # in both directions. The JSON frames that carry it base64-encode it (4/3 the
@@ -75,6 +80,16 @@ RELAY_REGISTER_WAIT = 15
 RELAY_WRITE_TIMEOUT = READ_TIMEOUT
 
 
+async def read_json_frame(reader, header_timeout=None) -> dict:
+    """One JSON object in a frame of at most MAX_RELAY_FRAME_SIZE bytes."""
+    frame = await read_frame(reader, MAX_RELAY_FRAME_SIZE,
+                             header_timeout=header_timeout)
+    message = json.loads(frame.decode())
+    if not isinstance(message, dict):
+        raise ValueError("relay frame is not a JSON object")
+    return message
+
+
 class RelayClient:
     """The peer side of the relay.
 
@@ -83,15 +98,22 @@ class RelayClient:
     answers each one (an async bytes -> reply bytes, or None; for a DHT node
     that is KademliaNode.dispatch). request() sends a request to another
     peer through the server. `virtual_ip` and `token` come from the join
-    reply.
+    reply. If `punch_handler` is set (a plain function taking the server's
+    punch_go message) the channel is registered as one that takes part in
+    hole punching and the handler is called for each punch_go. Such a channel
+    is opened from `local_addr`, the node's listening address, so that the
+    server sees the NAT's mapping of the listening port (see punch.py).
     """
 
     def __init__(self, server_address, virtual_ip: str, token: str,
-                 handler: Callable[[bytes], Awaitable[Optional[bytes]]]):
+                 handler: Callable[[bytes], Awaitable[Optional[bytes]]],
+                 local_addr=None):
         self.server_address = server_address
+        self.local_addr = local_addr
         self.virtual_ip = virtual_ip
         self.token = token
         self.handler = handler
+        self.punch_handler = None
         self._task = None
         self._registered = asyncio.Event()
 
@@ -154,22 +176,24 @@ class RelayClient:
 
     @staticmethod
     async def _read_json(reader, header_timeout=None) -> dict:
-        frame = await read_frame(reader, MAX_RELAY_FRAME_SIZE,
-                                 header_timeout=header_timeout)
-        message = json.loads(frame.decode())
-        if not isinstance(message, dict):
-            raise ValueError("relay frame is not a JSON object")
-        return message
+        return await read_json_frame(reader, header_timeout)
 
     async def _run(self):
         delay = RELAY_RECONNECT_MIN
         while True:
             writer = None
             try:
-                reader, writer = await connect(*self.server_address)
-                writer.write(json.dumps({
-                    'type': 'relay_register', 'virtual_ip': self.virtual_ip,
-                    'token': self.token}).encode())
+                if self.punch_handler is not None and self.local_addr:
+                    reader, writer = await connect_from(
+                        self.local_addr, self.server_address,
+                        kademlia_dht.CONNECT_TIMEOUT)
+                else:
+                    reader, writer = await connect(*self.server_address)
+                register = {'type': 'relay_register',
+                            'virtual_ip': self.virtual_ip, 'token': self.token}
+                if self.punch_handler is not None:
+                    register['punch'] = True
+                writer.write(json.dumps(register).encode())
                 await writer.drain()
                 ack = await self._read_json(reader)
                 if ack.get('type') != 'relay_registered':
@@ -221,6 +245,9 @@ class RelayClient:
     async def _handle_message(self, writer, message: dict):
         kind = message.get('type')
         if kind == 'pong':
+            return
+        if kind == 'punch_go' and self.punch_handler is not None:
+            self.punch_handler(message)   # returns at once: the punch runs as a task
             return
         if kind != 'relayed':
             print(f"Ignoring a {safe_text(kind)} frame on the relay channel")
