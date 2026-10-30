@@ -1093,6 +1093,48 @@ async def test_channel_client_answers_relayed_requests_and_refuses_bad_ones():
 
 
 @pytest.mark.asyncio
+async def test_channel_client_drops_a_channel_it_cannot_write_to(monkeypatch):
+    """A reply that never drains (the server stopped reading) is given up
+    after RELAY_WRITE_TIMEOUT and the channel reopened, instead of the read
+    loop hanging on it forever."""
+    monkeypatch.setattr(relay, "RELAY_WRITE_TIMEOUT", 0.2)
+    monkeypatch.setattr(relay, "RELAY_RECONNECT_MIN", 0.05)
+    real_write_frame = relay.write_frame
+
+    async def replies_never_drain(writer, data):
+        if json.loads(data.decode()).get('type') == 'relay_reply':
+            await asyncio.Event().wait()
+        await real_write_frame(writer, data)
+
+    monkeypatch.setattr(relay, "write_frame", replies_never_drain)
+    attempts = []
+
+    async def server(reader, writer):
+        attempts.append(1)
+        await reader.read(4096)  # relay_register
+        await real_write_frame(writer, json.dumps(
+            {'type': 'relay_registered'}).encode())
+        if len(attempts) == 1:
+            await real_write_frame(writer, json.dumps(
+                {'type': 'relayed', 'id': '1',
+                 'payload': base64.b64encode(b"hi").decode()}).encode())
+        await asyncio.sleep(1)
+        writer.close()
+
+    async def handler(payload):
+        return b"echo:" + payload
+
+    srv, port = await scripted_server(server)
+    client = RelayClient((IP, port), "10.0.0.1", "tok", handler)
+    try:
+        await client.start()
+        await wait_until(lambda: len(attempts) >= 2)
+    finally:
+        await client.stop()
+        await close_srv(srv)
+
+
+@pytest.mark.asyncio
 async def test_channel_client_keeps_retrying_when_registration_is_refused(
         monkeypatch):
     monkeypatch.setattr(relay, "RELAY_RECONNECT_MIN", 0.05)

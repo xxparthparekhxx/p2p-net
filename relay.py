@@ -69,6 +69,10 @@ RELAY_RECONNECT_MIN = 1
 RELAY_RECONNECT_MAX = 30
 # How long RelayClient.start() waits for the first registration to succeed.
 RELAY_REGISTER_WAIT = 15
+# A write on the channel that hasn't drained in this long means the server
+# stopped reading; the channel is dropped and reopened rather than left
+# blocking the read loop.
+RELAY_WRITE_TIMEOUT = READ_TIMEOUT
 
 
 class RelayClient:
@@ -195,11 +199,22 @@ class RelayClient:
             await asyncio.sleep(delay)
             delay = min(delay * 2, RELAY_RECONNECT_MAX)
 
+    @staticmethod
+    async def _send(writer, message: dict):
+        """Write one JSON frame on the channel, bounded by RELAY_WRITE_TIMEOUT."""
+        try:
+            await asyncio.wait_for(
+                write_frame(writer, json.dumps(message).encode()),
+                RELAY_WRITE_TIMEOUT)
+        except asyncio.TimeoutError:
+            writer.transport.abort()
+            raise ConnectionError("the server is not reading the channel")
+
     async def _ping_loop(self, writer):
         try:
             while True:
                 await asyncio.sleep(RELAY_PING_INTERVAL)
-                await write_frame(writer, json.dumps({'type': 'ping'}).encode())
+                await self._send(writer, {'type': 'ping'})
         except Exception:
             pass  # the read loop notices a broken connection
 
@@ -216,7 +231,7 @@ class RelayClient:
             out['error'] = 'could not handle the relayed message'
         else:
             out['payload'] = base64.b64encode(reply).decode()
-        await write_frame(writer, json.dumps(out).encode())
+        await self._send(writer, out)
 
     async def _answer(self, message: dict) -> Optional[bytes]:
         """The handler's reply to one relayed request, or None."""

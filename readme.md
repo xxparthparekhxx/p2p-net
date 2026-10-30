@@ -93,7 +93,7 @@ A peer behind a NAT that refuses inbound connections can still make outgoing con
      | `MAX_PENDING_RELAYS_PER_PEER` | 16 | Relays that may be waiting on one destination. |
      | `MAX_PENDING_RELAYS` | 64 | Relays waiting on replies, in total. |
      | `RELAY_TIMEOUT` | 15 s | How long the server waits for the destination's reply. |
-     | `RELAY_WRITE_TIMEOUT` | 10 s | A destination that does not read its channel is dropped. |
+     | `RELAY_WRITE_TIMEOUT` | 10 s | A channel write that has not drained by then drops the channel: the server drops a destination that stops reading, and a peer reopens its channel when the server stops reading. |
      | `RELAY_PING_INTERVAL` / `RELAY_IDLE_TIMEOUT` | 25 s / 90 s | A channel is pinged to keep a NAT mapping alive; a silent one is closed by either side. |
      | `RELAY_RECONNECT_MIN` / `RELAY_RECONNECT_MAX` | 1 s / 30 s | A dropped channel is reopened with a doubling delay. |
 
