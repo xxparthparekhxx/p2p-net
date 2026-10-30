@@ -218,6 +218,19 @@ def _family(ip: str) -> int:
     return socket.AF_INET6 if ":" in ip else socket.AF_INET
 
 
+def abort_on_close(sock) -> None:
+    """Make close() reset the TCP connection instead of ending it with a FIN.
+
+    A connection that closes normally leaves a TIME_WAIT entry (about a
+    minute) at the closing end, and while it exists the same local port
+    cannot connect to the same remote address again. A node connects out from
+    its one listening port, again and again, to the same STUN servers and
+    peers, so its connections must not leave one. Anything still unsent when
+    it closes is lost."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                    struct.pack("ii", 1, 0))
+
+
 def reusable_socket(local_addr: Optional[Address] = None,
                     kind: int = socket.SOCK_STREAM) -> socket.socket:
     """A non-blocking socket bound to `local_addr` with SO_REUSEADDR and
@@ -225,13 +238,16 @@ def reusable_socket(local_addr: Optional[Address] = None,
     such sockets). That is what lets a node connect out *from* its listening
     port: the NAT then maps the listening port, which is the mapping a hole
     punch uses. Linux needs SO_REUSEPORT on every socket that shares the
-    port, and the same user for all of them."""
+    port, and the same user for all of them. A TCP socket made here resets
+    its connection when closed (abort_on_close)."""
     ip, port = local_addr or ("0.0.0.0", 0)
     sock = socket.socket(_family(ip), kind)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if hasattr(socket, "SO_REUSEPORT"):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        if kind == socket.SOCK_STREAM:
+            abort_on_close(sock)
         sock.setblocking(False)
         sock.bind((ip, port))
     except BaseException:

@@ -728,6 +728,50 @@ def test_reusable_sockets_share_a_port():
             s.close()
 
 
+@pytest.mark.asyncio
+async def test_a_tcp_connection_from_a_shared_port_is_reset_when_it_closes():
+    """No TIME_WAIT entry may keep the shared port from connecting to the same
+    address again, so closing resets the connection instead of ending it with
+    a FIN (UDP sockets are left alone)."""
+    seen = []
+
+    async def handler(reader, writer):
+        try:
+            await reader.read()
+            seen.append("eof")
+        except ConnectionResetError:
+            seen.append("reset")
+        writer.close()
+
+    server = await asyncio.start_server(handler, IP, 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        local = free_port()
+        reader, writer = await stun.connect_from((IP, local), (IP, port), 2)
+        sock = writer.get_extra_info("socket")
+        assert struct.unpack("ii", sock.getsockopt(
+            socket.SOL_SOCKET, socket.SO_LINGER, 8)) == (1, 0)
+        writer.close()
+        await writer.wait_closed()
+        for _ in range(100):
+            if seen:
+                break
+            await asyncio.sleep(0.02)
+        assert seen == ["reset"]
+        # The same local port connects to the same address again at once.
+        reader, writer = await stun.connect_from((IP, local), (IP, port), 2)
+        writer.close()
+    finally:
+        server.close()
+        await server.wait_closed()
+    udp = reusable_socket((IP, 0), socket.SOCK_DGRAM)
+    try:
+        assert struct.unpack("ii", udp.getsockopt(
+            socket.SOL_SOCKET, socket.SO_LINGER, 8)) == (0, 0)
+    finally:
+        udp.close()
+
+
 # --- Live tests: skipped unless P2P_NET_LIVE_STUN is set ---
 
 live = pytest.mark.skipif(not os.environ.get("P2P_NET_LIVE_STUN"),
