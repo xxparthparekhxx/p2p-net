@@ -54,6 +54,10 @@ READ_TIMEOUT = 10
 # up (about two minutes on Linux), so connections go through connect().
 CONNECT_TIMEOUT = 5
 
+# The first frame of an inbound connection that is a hole-punched channel
+# rather than a DHT request: PUNCH_HELLO followed by the punch id (punch.py).
+PUNCH_HELLO = b"PUNCH "
+
 # Domain separator for signed STORE records. Covers key, sequence number and
 # value so an old signed STORE cannot be replayed to roll a record back.
 STORE_DOMAIN_SEPARATOR = b"p2p-net/STORE/v1\0"
@@ -651,7 +655,7 @@ class KademliaProtocol:
 
 class KademliaNode:
     def __init__(self, id: int, ip: str, port: int,
-                 key_path: Optional[str] = None, relay=None):
+                 key_path: Optional[str] = None, relay=None, punch=None):
         self.id = id
         self.ip = ip
         self.port = port
@@ -679,6 +683,14 @@ class KademliaNode:
         # dialed directly. P2PNode sets it to its introduction-server relay;
         # a bare KademliaNode has no relay and only dials directly.
         self.relay = relay
+        # Optional TCP hole punching, the same shape as `relay`: an async
+        # callable (Node, bytes) -> reply bytes (or None) that sends the
+        # request over a punched connection to the contact, opening one if
+        # it can. punch_accept(reader, writer, first_frame) takes over an
+        # inbound connection whose first frame is a PUNCH_HELLO. P2PNode sets
+        # both when hole punching is on; a bare KademliaNode sets neither.
+        self.punch = punch
+        self.punch_accept = None
 
     def sign_record(self, key: int, seq: int, value_bytes: bytes) -> bytes:
         return self.signing_key.sign(record_message(key, seq, value_bytes))
@@ -724,28 +736,39 @@ class KademliaNode:
 
         A contact is dialed directly, and if the connection cannot be made
         (it is behind a NAT that refuses inbound connections) the request
-        goes through the relay hook instead, which asks the introduction
-        server to forward it over the contact's persistent relay connection.
-        The relay needs the contact's virtual ip. A contact the introduction
-        server already found unreachable (reachable is False) is relayed
-        first, since dialing it would only wait out CONNECT_TIMEOUT; the
-        direct dial is then its fallback (e.g. a peer on the same LAN).
+        goes by one of two indirect paths, in this order. First a punched
+        connection (the punch hook: a TCP connection that both peers opened
+        at each other through the NATs, reused for later requests), if hole
+        punching is on and the contact is not known to be unpunchable. Then
+        the relay hook, which asks the introduction server to forward the
+        request over the contact's persistent relay connection. Both need the
+        contact's virtual ip. A contact the introduction server already found
+        unreachable (reachable is False) takes the indirect paths first,
+        since dialing it would only wait out CONNECT_TIMEOUT; the direct dial
+        is then its last resort (e.g. a peer on the same LAN).
         A contact that accepted the connection but did not answer is not
-        retried through the relay: the relay could not help.
+        retried by another path: the relay could not help.
         """
-        can_relay = self.relay is not None and node.virtual_ip is not None
-        relay_first = can_relay and node.reachable is False
-        if relay_first:
-            response = await self._relay_exchange(node, request)
-            if response is not None:
-                return response
+        paths = []
+        if self.punch is not None and node.virtual_ip is not None:
+            paths.append(self._punch_exchange)
+        if self.relay is not None and node.virtual_ip is not None:
+            paths.append(self._relay_exchange)
+        if node.reachable is False:
+            for path in paths:
+                response = await path(node, request)
+                if response is not None:
+                    return response
+            paths = []
         try:
             reader, writer = await connect(node.ip, node.port)
         except Exception as e:
             print(f"Direct connection to node {node.id} "
                   f"({safe_text(node.ip)} port {node.port}) failed: {e}")
-            if can_relay and not relay_first:
-                return await self._relay_exchange(node, request)
+            for path in paths:
+                response = await path(node, request)
+                if response is not None:
+                    return response
             return None
         try:
             await write_frame(writer, request)
@@ -760,6 +783,15 @@ class KademliaNode:
                 await writer.wait_closed()
             except Exception:
                 pass
+
+    async def _punch_exchange(self, node: Node, request: bytes
+                              ) -> Optional[bytes]:
+        try:
+            return await self.punch(node, request)
+        except Exception as e:
+            print(f"Punched connection to node {node.id} at virtual ip "
+                  f"{safe_text(node.virtual_ip)} failed: {e}")
+            return None
 
     async def _relay_exchange(self, node: Node, request: bytes
                               ) -> Optional[bytes]:
@@ -955,6 +987,13 @@ class KademliaNode:
             # ValueError covers messages whose length prefix exceeds the cap.
             writer.close()
             await writer.wait_closed()
+            return
+
+        if data.startswith(PUNCH_HELLO) and self.punch_accept is not None:
+            # A peer's hole-punched channel: the connection stays open, owned
+            # by the punch client (it closes it if it is not the peer it
+            # expects).
+            await self.punch_accept(reader, writer, data)
             return
 
         try:
