@@ -407,6 +407,22 @@ async def test_udp_unresolvable_server_is_an_oserror():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["udp", "tcp"])
+async def test_a_name_that_never_resolves_times_out(monkeypatch, protocol):
+    monkeypatch.setattr(stun, "STUN_RESOLVE_TIMEOUT", 0.2)
+
+    def slow_getaddrinfo(*args, **kwargs):
+        time.sleep(1)
+        return []
+
+    monkeypatch.setattr(socket, "getaddrinfo", slow_getaddrinfo)
+    started = time.monotonic()
+    with pytest.raises(StunError, match="resolving"):
+        await stun.binding_request(("stun.example", 3478), protocol)
+    assert time.monotonic() - started < 0.9
+
+
+@pytest.mark.asyncio
 async def test_udp_socket_is_closed_afterwards(monkeypatch, fast_udp):
     made = []
     real = stun.reusable_socket

@@ -17,6 +17,7 @@ over loopback TCP.
 import asyncio
 import json
 import socket
+import struct
 
 import pytest
 
@@ -459,6 +460,35 @@ async def test_a_stalled_target_write_fails_the_punch_and_frees_its_slot(monkeyp
         await teardown(srv, *opened)
 
 
+@pytest.mark.asyncio
+async def test_a_stalled_initiator_write_ends_the_punch_and_frees_its_slot(monkeypatch):
+    """The initiator stops reading its connection: the server cuts the write
+    to it off after RELAY_WRITE_TIMEOUT and drops it, so the slot is not held."""
+    monkeypatch.setattr(introduction_server, "RELAY_WRITE_TIMEOUT", 0.2)
+    monkeypatch.setattr(introduction_server, "MAX_PENDING_PUNCHES_PER_SENDER", 1)
+    real_write_frame = introduction_server.write_frame
+
+    async def never_drains(writer, data):
+        if b'punch_go' in data and b'"from"' not in data:   # the one for the initiator
+            await asyncio.Event().wait()
+        await real_write_frame(writer, data)
+
+    monkeypatch.setattr(introduction_server, "write_frame", never_drains)
+    server, srv, port, (a, b), (chan_a, chan_b) = await punch_setup(2, 2)
+    try:
+        for _ in range(2):   # the second would be 'too many' if the slot leaked
+            reader, writer = await start_punch(port, a, b['virtual_ip'])
+            try:
+                await asyncio.wait_for(reader.read(), 3)   # dropped, not left hanging
+            except ConnectionError:
+                pass
+            await wait_until(lambda: server.pending_punches == {})
+            await close_writers(writer)
+            await chan_b.next_go()
+    finally:
+        await teardown(srv, chan_a, chan_b)
+
+
 # --- PunchedChannel ---
 
 
@@ -609,6 +639,7 @@ async def test_channel_limits_requests_in_flight_each_way(monkeypatch):
 @pytest.mark.parametrize("raw", [
     channel_frame(9, 1, b"?"),                                   # unknown kind
     len(b"abc").to_bytes(4, "big") + b"abc",                     # shorter than a header
+    (4).to_bytes(4, "big") + bytes([punch.REQUEST, 0, 0, 0]),    # a request id cut short
     (punch.MAX_PUNCH_FRAME_SIZE + 1).to_bytes(4, "big"),         # over the size cap
 ])
 async def test_channel_is_closed_by_a_frame_it_cannot_accept(raw):
@@ -1562,3 +1593,350 @@ async def test_stop_in_the_middle_of_a_punch_cancels_it(monkeypatch, dials):
             srv.close()
     await asyncio.sleep(0.05)
     assert made and all(s.fileno() == -1 for s in made)
+
+
+# --- Guards that mutation checks showed nothing was testing ---
+
+
+class PunchRun:
+    """One PunchClient punching toward a scripted peer. `peer_script` runs for
+    each connection the client makes to it; `connections` counts them."""
+
+    def __init__(self, peer_script, punch_id="x"):
+        self.peer_script, self.punch_id = peer_script, punch_id
+        self.connections = 0
+
+    async def __aenter__(self):
+        async def counting(reader, writer):
+            self.connections += 1
+            await self.peer_script(reader, writer)
+
+        self.peer_srv, peer_port = await scripted_server(counting)
+        self.srv, server_port = await scripted_server(go_server(
+            {'type': 'punch_go', 'id': self.punch_id,
+             'peer': {'ip': IP, 'port': peer_port}}))
+        self.client = PunchClient((IP, server_port), "10.0.0.1", "tok",
+                                  (IP, dead_port()), echo)
+        return self
+
+    async def request(self):
+        return await self.client.request(
+            Node(2, IP, 1, virtual_ip="10.0.0.2"), b"PING")
+
+    async def __aexit__(self, *exc):
+        await self.client.stop()
+        await close_srv(self.srv)
+        await close_srv(self.peer_srv)
+
+
+@pytest.fixture
+def short_punch(monkeypatch):
+    monkeypatch.setattr(punch, "PUNCH_WINDOW", 0.7)
+    monkeypatch.setattr(punch, "PUNCH_RETRY_INTERVAL", 0.05)
+
+
+async def stream_pair():
+    """Two ends of a loopback TCP connection: (reader, writer) of each, and
+    the listening server."""
+    accepted = asyncio.get_running_loop().create_future()
+    srv = await asyncio.start_server(
+        lambda r, w: accepted.set_result((r, w)), IP, 0)
+    one = await asyncio.open_connection(IP, srv.sockets[0].getsockname()[1])
+    return one, await accepted, srv
+
+
+@pytest.mark.asyncio
+async def test_a_peer_that_answers_without_the_punch_prefix_is_not_taken_for_the_peer(
+        short_punch, monkeypatch):
+    async def peer(reader, writer):
+        await read_frame(reader)
+        await write_frame(writer, b"NOTYOU" + b"x")   # the right id, the wrong hello
+        await asyncio.sleep(0.1)
+        writer.close()
+
+    async with PunchRun(peer) as run:
+        added = []
+        monkeypatch.setattr(run.client, "_add_channel",
+                            lambda *args: added.append(args))
+        assert await run.request() is None
+        assert added == [] and run.connections > 1
+
+
+@pytest.mark.asyncio
+async def test_a_peer_that_answers_with_a_stranger_id_has_its_connection_closed(
+        short_punch):
+    closed = []
+
+    async def peer(reader, writer):
+        await read_frame(reader)
+        await write_frame(writer, PUNCH_HELLO + b"nope")
+        try:
+            closed.append(await asyncio.wait_for(reader.read(), 1) == b"")
+        except ConnectionError:
+            closed.append(True)        # reset: the abort_on_close kind of closing
+        except asyncio.TimeoutError:
+            closed.append(False)
+
+    async with PunchRun(peer) as run:
+        assert await run.request() is None
+        await wait_until(lambda: len(closed) == run.connections)
+    assert closed and all(closed)
+
+
+@pytest.mark.asyncio
+async def test_a_hello_answer_over_the_size_cap_is_refused_unread(short_punch):
+    """The declared length alone is enough: the body is never waited for, so
+    the client retries at once instead of stalling for the handshake timeout."""
+    async def peer(reader, writer):
+        await read_frame(reader)
+        writer.write((punch.MAX_HELLO_SIZE + 1).to_bytes(4, "big"))
+        await writer.drain()
+        await asyncio.sleep(5)
+
+    async with PunchRun(peer) as run:
+        started = asyncio.get_running_loop().time()
+        assert await run.request() is None
+        assert asyncio.get_running_loop().time() - started < 2.5
+        assert run.connections >= 3
+
+
+@pytest.mark.asyncio
+async def test_a_peer_that_never_answers_the_hello_is_given_up_on_and_redialed(
+        short_punch, monkeypatch):
+    monkeypatch.setattr(punch, "PUNCH_HANDSHAKE_TIMEOUT", 0.1)
+
+    async def peer(reader, writer):
+        await read_frame(reader)
+        await asyncio.sleep(5)
+
+    async with PunchRun(peer) as run:
+        started = asyncio.get_running_loop().time()
+        assert await asyncio.wait_for(run.request(), 4) is None
+        assert asyncio.get_running_loop().time() - started < 2.5
+        assert run.connections >= 3
+
+
+@pytest.mark.asyncio
+async def test_a_dial_that_hangs_is_cut_off_and_retried(
+        monkeypatch, short_punch, dials):
+    """A SYN dropped by a NAT is not refused: the attempt waits, so each
+    attempt has its own limit, short of the window, and the dial goes on."""
+    monkeypatch.setattr(punch, "PUNCH_ATTEMPT_TIMEOUT", 0.15)
+    firewall = Firewall()
+    await asyncio.sleep(0.05)
+    srv, server_port = await scripted_server(go_server(
+        {'type': 'punch_go', 'id': "x", 'peer': {'ip': IP, 'port': firewall.port}}))
+    client = PunchClient((IP, server_port), "10.0.0.1", "tok",
+                         (IP, dead_port()), echo)
+    try:
+        assert await client.request(
+            Node(2, IP, 1, virtual_ip="10.0.0.2"), b"PING") is None
+        assert len(dials) >= 3
+    finally:
+        await client.stop()
+        firewall.close()
+        await close_srv(srv)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_dial_waits_before_the_next(monkeypatch, short_punch, dials):
+    monkeypatch.setattr(punch, "PUNCH_RETRY_INTERVAL", 0.2)
+    refused = dead_port()
+    srv, server_port = await scripted_server(go_server(
+        {'type': 'punch_go', 'id': "x", 'peer': {'ip': IP, 'port': refused}}))
+    client = PunchClient((IP, server_port), "10.0.0.1", "tok",
+                         (IP, dead_port()), echo)
+    try:
+        assert await client.request(
+            Node(2, IP, 1, virtual_ip="10.0.0.2"), b"PING") is None
+        assert 2 <= len(dials) <= 6      # a window of 0.7 s at 0.2 s apart
+    finally:
+        await client.stop()
+        await close_srv(srv)
+
+
+@pytest.mark.asyncio
+async def test_a_request_over_the_message_cap_does_not_start_a_punch():
+    contacts = []
+
+    async def server(reader, writer):
+        contacts.append(1)
+        writer.close()
+
+    srv, server_port = await scripted_server(server)
+    client = PunchClient((IP, server_port), "10.0.0.1", "tok",
+                         (IP, dead_port()), echo)
+    try:
+        assert await client.request(
+            Node(2, IP, 1, virtual_ip="10.0.0.2"),
+            b"x" * (kademlia_dht.MAX_MESSAGE_SIZE + 1)) is None
+        assert contacts == [] and client._attempts == {}
+    finally:
+        await client.stop()
+        await close_srv(srv)
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_client_takes_no_new_channel():
+    (reader, writer), (peer_reader, peer_writer), srv = await stream_pair()
+    client = PunchClient((IP, 1), "10.0.0.1", "tok", (IP, 0), echo)
+    try:
+        await client.stop()
+        assert client._add_channel("10.0.0.2", reader, writer) is None
+        assert client.channels == {}
+        assert await asyncio.wait_for(peer_reader.read(), 2) in (b"", )
+    finally:
+        await close_writers(writer, peer_writer)
+        await close_srv(srv)
+
+
+@pytest.mark.asyncio
+async def test_a_new_channel_to_a_contact_replaces_and_closes_the_old_one():
+    (r1, w1), (pr1, pw1), srv1 = await stream_pair()
+    (r2, w2), (pr2, pw2), srv2 = await stream_pair()
+    client = PunchClient((IP, 1), "10.0.0.1", "tok", (IP, 0), echo)
+    try:
+        old = client._add_channel("10.0.0.2", r1, w1)
+        new = client._add_channel("10.0.0.2", r2, w2)
+        assert old.closed and not new.closed
+        assert client.channels == {"10.0.0.2": new}
+    finally:
+        await client.stop()
+        await close_writers(pw1, pw2)
+        await close_srv(srv1)
+        await close_srv(srv2)
+
+
+@pytest.mark.asyncio
+async def test_stop_returns_only_when_the_channel_tasks_are_done():
+    (reader, writer), (peer_reader, peer_writer), srv = await stream_pair()
+    client = PunchClient((IP, 1), "10.0.0.1", "tok", (IP, 0), echo)
+    channel = client._add_channel("10.0.0.2", reader, writer)
+    await client.stop()
+    assert channel.closed and channel._task.done()
+    await close_writers(peer_writer)
+    await close_srv(srv)
+
+
+@pytest.mark.asyncio
+async def test_the_surplus_connection_is_closed_when_both_paths_come_up_at_once(
+        monkeypatch):
+    """The peer's SYN reached our listener and our own dial succeeded at the
+    same moment: one connection is kept, the other is closed."""
+    inbound, inbound_peer, srv1 = await stream_pair()
+    dialed, dialed_peer, srv2 = await stream_pair()
+    client = PunchClient((IP, 1), "10.0.0.1", "tok", (IP, 0), echo)
+
+    async def dial_and_accept_together(ip, port, punch_id):
+        client._expected[punch_id][1].set_result(inbound)
+        return dialed
+
+    monkeypatch.setattr(client, "_dial", dial_and_accept_together)
+    channel = await client._open("10.0.0.2", {
+        'id': "x", 'peer': {'ip': IP, 'port': 80}})
+    try:
+        assert channel is not None and channel.writer is inbound[1]
+        assert await asyncio.wait_for(dialed_peer[0].read(), 2) == b""
+    finally:
+        await client.stop()
+        await close_writers(inbound_peer[1], dialed_peer[1])
+        await close_srv(srv1)
+        await close_srv(srv2)
+
+
+@pytest.mark.asyncio
+async def test_a_punch_id_the_server_reuses_is_refused(monkeypatch):
+    monkeypatch.setattr(punch, "PUNCH_WINDOW", 0.5)
+    refused = dead_port()
+    go = {'id': "same", 'peer': {'ip': IP, 'port': refused}}
+    client = PunchClient((IP, 1), "10.0.0.1", "tok", (IP, dead_port()), echo)
+    first = asyncio.create_task(client._open("10.0.0.2", go))
+    await wait_until(lambda: "same" in client._expected)
+    with pytest.raises(ValueError, match="reused"):
+        await client._open("10.0.0.3", go)
+    assert "same" in client._expected        # the first punch is untouched
+    assert await first is None
+    assert client._expected == {}
+    await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_punch_go_without_a_sender_is_ignored():
+    client = PunchClient((IP, 1), "10.0.0.1", "tok", (IP, dead_port()), echo)
+    client.handle_go({'type': 'punch_go', 'id': "x",
+                      'peer': {'ip': IP, 'port': 80}})
+    client.handle_go({'type': 'punch_go', 'from': 7, 'id': "x",
+                      'peer': {'ip': IP, 'port': 80}})
+    assert client._responders == set()
+    await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_punch_ids_are_long_and_never_repeat():
+    server, srv, port, (a, b), (chan_a, chan_b) = await punch_setup(2, 2)
+    try:
+        ids = []
+        for _ in range(3):
+            reader, writer = await start_punch(port, a, b['virtual_ip'])
+            ids.append((await read_json_frame(reader))['id'])
+            await close_writers(writer)
+            await wait_until(lambda: not server.pending_punches)
+        assert len(set(ids)) == 3 and all(len(i) >= 20 for i in ids)
+    finally:
+        await teardown(srv, chan_a, chan_b)
+
+
+@pytest.mark.asyncio
+async def test_a_channel_closes_with_a_reset_whichever_side_opened_the_connection():
+    """A connection that reached the listener is accepted by the OS, not made
+    by connect_from, and must reset on close too, or its TIME_WAIT entry would
+    block the next connect() from the listening port to that peer."""
+    (reader, writer), (peer_reader, peer_writer), srv = await stream_pair()
+    client = PunchClient((IP, 1), "10.0.0.1", "tok", (IP, 0), echo)
+    try:
+        client._add_channel("10.0.0.2", reader, writer)
+        linger = writer.get_extra_info('socket').getsockopt(
+            socket.SOL_SOCKET, socket.SO_LINGER, struct.calcsize("ii"))
+        assert struct.unpack("ii", linger) == (1, 0)
+    finally:
+        await client.stop()
+        await close_writers(peer_writer)
+        await close_srv(srv)
+
+
+@pytest.mark.asyncio
+async def test_joining_again_stops_the_previous_punch_client(tmp_path, monkeypatch):
+    async with Lab(tmp_path, monkeypatch) as lab:
+        a = await lab.node("a")
+        first = a.punch
+        await a._start_relay(a.relay.token, True)
+        assert first._stopped and a.punch is not first and not a.punch._stopped
+
+
+@pytest.mark.asyncio
+async def test_a_node_without_punch_support_drops_a_hello_without_an_error(hello_node):
+    """Not even a logged traceback: the hello is handled as the unknown
+    command it is to such a node."""
+    loop = asyncio.get_running_loop()
+    errors = []
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+    client, future, srv, port = await hello_node(accept=False)
+    try:
+        reader, writer = await hello(port, b"the-id")
+        assert await asyncio.wait_for(reader.read(), 2) == b""
+        await asyncio.sleep(0.05)
+        assert errors == []
+        writer.close()
+    finally:
+        loop.set_exception_handler(None)
+        srv.close()
+        await srv.wait_closed()
+
+
+def test_a_node_needs_a_fixed_port_to_punch(tmp_path):
+    fixed = P2PNode(IP, 5000, key_path=str(tmp_path / "a.key"), hole_punching=True)
+    zero = P2PNode(IP, 0, key_path=str(tmp_path / "b.key"), hole_punching=True)
+    off = P2PNode(IP, 5000, key_path=str(tmp_path / "c.key"))
+    assert fixed._punching_possible(True) is True
+    assert zero._punching_possible(True) is False
+    assert off._punching_possible(True) is False
