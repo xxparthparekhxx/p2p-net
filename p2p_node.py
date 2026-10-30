@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import os
 import random
 import json
@@ -16,6 +17,7 @@ from kademlia_dht import (
     write_private_file,
 )
 from relay import RelayClient
+from upnp import UPnPMapping
 
 
 class IntroductionServerUnreachable(ConnectionError):
@@ -59,8 +61,16 @@ def load_owner_pins(path: str) -> Dict[str, bytes]:
     return pins
 
 
+def is_loopback(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip).is_loopback
+    except ValueError:
+        return False  # a hostname, say
+
+
 class P2PNode:
-    def __init__(self, ip: str, port: int, key_path: Optional[str] = None):
+    def __init__(self, ip: str, port: int, key_path: Optional[str] = None,
+                 upnp: bool = True):
         self.ip = ip
         self.port = port
         self.id = sha1_hash(f"{ip}:{port}")
@@ -76,6 +86,11 @@ class P2PNode:
         self.intro_server_address = None
         self.relay = None
         self.server = None
+        # Optional UPnP port mapping (needs the miniupnpc package): start()
+        # tries it unless `upnp` is False or the node listens on loopback,
+        # and stop() removes it.
+        self.use_upnp = upnp
+        self.upnp = None
         # Client-side owner pins: domain -> owner public key, recorded the
         # first time a name resolves and enforced on every later lookup. They
         # are saved (0600) next to the key file so they survive restarts.
@@ -182,9 +197,13 @@ class P2PNode:
         return await self.relay.request(node.virtual_ip, request)
 
     async def stop(self):
-        """Close the relay channel and stop listening."""
+        """Close the relay channel, remove the UPnP mapping and stop
+        listening."""
         if self.relay is not None:
             await self.relay.stop()
+        if self.upnp is not None:
+            await self.upnp.close()
+            self.upnp = None
         if self.server is not None:
             self.server.close()
             await self.server.wait_closed()
@@ -232,6 +251,12 @@ class P2PNode:
             self.kademlia.handle_connection, self.ip, self.port
         )
         print(f"P2P node listening on {self.ip}:{self.port}")
+        if self.use_upnp and not is_loopback(self.ip):
+            self.upnp = UPnPMapping(self.port)
+            if await self.upnp.open():
+                print(f"UPnP: router forwards TCP port {self.port} to this "
+                      f"host (router external address: "
+                      f"{safe_text(self.upnp.external_ip)})")
 
     async def run(self):
         try:
