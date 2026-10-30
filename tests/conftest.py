@@ -1,3 +1,5 @@
+import signal
+
 import pytest
 
 import upnp
@@ -17,3 +19,28 @@ def no_real_upnp(monkeypatch):
     """A machine that has miniupnpc installed must not have the tests talk
     to its router; tests that cover UPnP install a fake instead."""
     monkeypatch.setattr(upnp, "miniupnpc", None)
+
+
+TEST_TIMEOUT = 30
+
+
+@pytest.fixture(autouse=True)
+def hung_test_fails(request):
+    """A test that hangs (a bug that leaves it waiting on a socket nothing
+    will close) fails after TEST_TIMEOUT seconds instead of stalling the
+    run. Unix only; the alarm raises inside the event loop's wait."""
+    if not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def expired(signum, frame):
+        raise TimeoutError(f"{request.node.name} did not finish in "
+                           f"{TEST_TIMEOUT}s: hung")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.alarm(TEST_TIMEOUT)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
