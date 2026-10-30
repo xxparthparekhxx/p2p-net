@@ -15,6 +15,7 @@ from kademlia_dht import (
     sha1_hash,
     write_private_file,
 )
+from relay import RelayClient
 
 
 class IntroductionServerUnreachable(ConnectionError):
@@ -67,6 +68,14 @@ class P2PNode:
         # ~/.p2p-net/node_<port>.key) so this node keeps its names on restart.
         self.kademlia = KademliaNode(self.id, ip, port, key_path=key_path)
         self.virtual_ip = None
+        # NAT traversal state, filled in by join_network: the address the
+        # introduction server observed for us, whether it could dial us back,
+        # and the relay client (a persistent channel only when it could not).
+        self.observed_address = None
+        self.directly_reachable = None
+        self.intro_server_address = None
+        self.relay = None
+        self.server = None
         # Client-side owner pins: domain -> owner public key, recorded the
         # first time a name resolves and enforced on every later lookup. They
         # are saved (0600) next to the key file so they survive restarts.
@@ -91,6 +100,7 @@ class P2PNode:
 
     async def join_network(self, intro_server_address: tuple[str, int]):
         host, port = intro_server_address
+        self.intro_server_address = intro_server_address
         try:
             reader, writer = await connect(host, port)
         except OSError as e:  # refused, unresolvable, or timed out
@@ -122,15 +132,22 @@ class P2PNode:
             response = json.loads(response_data.decode())
 
             self.virtual_ip = response['virtual_ip']
+            self.observed_address = response.get('observed_address')
+            self.directly_reachable = response.get('directly_reachable', True)
 
             bootstrap_nodes = [
                 Node(sha1_hash(f"{peer['public_ip']}:{peer['port']}"),
                      peer['public_ip'],
                      peer['port'],
                      public_key=base64.b64decode(peer['public_key'])
-                     if peer.get('public_key') else None)
+                     if peer.get('public_key') else None,
+                     reachable=peer.get('reachable'),
+                     virtual_ip=peer.get('virtual_ip'))
                 for peer in response['nearby_peers']
             ]
+
+            if response.get('relay_token') is not None:
+                await self._start_relay(response['relay_token'])
 
             if bootstrap_nodes:
                 await self.kademlia.bootstrap(bootstrap_nodes)
@@ -138,12 +155,39 @@ class P2PNode:
                 print("No bootstrap nodes available")
 
             print(f"Joined network with virtual IP: {self.virtual_ip}")
+            if self.observed_address:
+                print(f"Introduction server sees us at "
+                      f"{safe_text(self.observed_address)}")
 
         except Exception as e:
             print(f"Error while joining the network: {e}")
         finally:
             writer.close()
             await writer.wait_closed()
+
+    async def _start_relay(self, token: str):
+        """Set up the relay: DHT requests to contacts we can't dial go
+        through the introduction server, and if the server could not dial us
+        back either, keep a channel open so peers can reach us the same way."""
+        if self.relay is not None:
+            await self.relay.stop()
+        self.relay = RelayClient(self.intro_server_address, self.virtual_ip,
+                                 token, self.kademlia.dispatch)
+        self.kademlia.relay = self._relay_rpc
+        if not self.directly_reachable:
+            print("Not directly reachable; opening a relay channel")
+            await self.relay.start()
+
+    async def _relay_rpc(self, node: Node, request: bytes) -> Optional[bytes]:
+        return await self.relay.request(node.virtual_ip, request)
+
+    async def stop(self):
+        """Close the relay channel and stop listening."""
+        if self.relay is not None:
+            await self.relay.stop()
+        if self.server is not None:
+            self.server.close()
+            await self.server.wait_closed()
 
     async def register_domain(self, domain: str, ip: str):
         domain_hash = sha1_hash(domain)
@@ -190,8 +234,11 @@ class P2PNode:
         print(f"P2P node listening on {self.ip}:{self.port}")
 
     async def run(self):
-        async with self.server:
-            await self.server.serve_forever()
+        try:
+            async with self.server:
+                await self.server.serve_forever()
+        finally:
+            await self.stop()
 
 async def main():
     # Create a network of nodes

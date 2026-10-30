@@ -7,16 +7,20 @@ import pytest
 
 import introduction_server
 import kademlia_dht
+import relay
 from introduction_server import IntroductionServer
 from kademlia_dht import (
     KademliaNode,
     MAX_MESSAGE_SIZE,
     Node,
+    RoutingTable,
     parse_node_list,
     read_frame,
+    sha1_hash,
     write_frame,
 )
-from relay import MAX_RELAY_FRAME_SIZE, MAX_RELAYED_MESSAGE_SIZE
+from p2p_node import P2PNode
+from relay import MAX_RELAY_FRAME_SIZE, MAX_RELAYED_MESSAGE_SIZE, RelayClient
 
 IP = "127.0.0.1"
 
@@ -792,3 +796,378 @@ async def test_read_frame_header_timeout_is_separate_from_the_body_timeout(
     reader.feed_data((9).to_bytes(4, "big") + b"abc")  # body never completes
     with pytest.raises(ValueError, match="body"):
         await read_frame(reader, header_timeout=2)
+
+
+# --- Relay on the peer side: RelayClient and P2PNode ---
+
+
+async def wait_until(predicate, tries=200, delay=0.02):
+    for _ in range(tries):
+        if predicate():
+            return
+        await asyncio.sleep(delay)
+    raise AssertionError("condition never became true")
+
+
+class Network:
+    """An in-process introduction server and the P2PNodes joined to it; the
+    nodes are stopped and the server closed on exit."""
+
+    def __init__(self, tmp_path):
+        self.tmp_path = tmp_path
+        self.nodes = []
+
+    async def __aenter__(self):
+        self.server, self.srv, self.port = await start_intro()
+        return self
+
+    async def __aexit__(self, *exc):
+        for node in self.nodes:
+            await node.stop()
+        await close_srv(self.srv)
+
+    async def node(self, name, behind_nat=False):
+        """Join a node. A node 'behind a NAT' is simulated by one that
+        advertises a port nothing listens on: the server's dial-back is
+        refused, exactly as a router that drops inbound connections would
+        make it fail."""
+        key = str(self.tmp_path / f"{name}.key")
+        node = P2PNode(IP, dead_port(), key_path=key)
+        if not behind_nat:
+            await node.start()
+        self.nodes.append(node)
+        await node.join_network((IP, self.port))
+        assert node.directly_reachable is not behind_nat
+        return node
+
+    def contacts(self, node):
+        return {n.virtual_ip: n for bucket in node.kademlia.routing_table.buckets
+                for n in bucket.nodes}
+
+
+@pytest.mark.asyncio
+async def test_peers_behind_a_nat_take_part_through_the_relay(tmp_path):
+    """Simulated NAT: B never accepts inbound connections. It joins, keeps a
+    relay channel open, and still receives STOREs and answers FIND_VALUEs
+    that other peers send it through the introduction server."""
+    async with Network(tmp_path) as net:
+        a = await net.node("a")
+        b = await net.node("b", behind_nat=True)
+        assert b.observed_address['ip'] == IP
+        assert b.virtual_ip in net.server.relay_channels
+        assert a.virtual_ip not in net.server.relay_channels  # reachable
+        # b's bootstrap ping went to a directly, and a is in its table.
+        assert a.virtual_ip in net.contacts(b)
+
+        c = await net.node("c")
+        # c's bootstrap ping to b could only succeed through the relay.
+        contact = net.contacts(c)[b.virtual_ip]
+        assert contact.reachable is False and contact.port == b.port
+
+        # c registers a name; the STORE reaches b over the relay and b keeps
+        # it as c's signed record.
+        assert await c.register_domain("nat.test", "10.7.7.7")
+        key = sha1_hash("nat.test")
+        assert b.kademlia.data[key][0] == c.kademlia.owner_public_key
+
+        # b resolves it: a direct lookup of a, plus its own copy.
+        assert await b.lookup_domain("nat.test") == "10.7.7.7"
+
+        # With only b in its routing table, c's lookup is answered by b
+        # through the relay, and the reply is the signed record.
+        c.kademlia.routing_table = RoutingTable(c.id)
+        c.kademlia.routing_table.add(contact)
+        c.kademlia.data.clear()
+        record, _ = await c.kademlia.find_record(key)
+        assert record.value == "10.7.7.7"
+        assert record.owner == c.kademlia.owner_public_key
+
+
+@pytest.mark.asyncio
+async def test_two_peers_behind_nats_reach_each_other(tmp_path):
+    async with Network(tmp_path) as net:
+        b = await net.node("b", behind_nat=True)
+        d = await net.node("d", behind_nat=True)
+        # d's bootstrap ping to b went relay-to-relay.
+        assert b.virtual_ip in net.contacts(d)
+        assert len(net.server.relay_channels) == 2
+
+
+@pytest.mark.asyncio
+async def test_relayed_record_is_verified_end_to_end(tmp_path):
+    """The relay is not trusted for content: a relayed reply that was
+    altered on the way fails the Ed25519 check and is ignored."""
+    async with Network(tmp_path) as net:
+        b = await net.node("b", behind_nat=True)
+        c = await net.node("c")
+        key = sha1_hash("forged.test")
+        await b.kademlia.store(key, "10.1.1.1")  # signed by b, local copy
+        contact = net.contacts(c)[b.virtual_ip]
+        c.kademlia.routing_table = RoutingTable(c.id)
+        c.kademlia.routing_table.add(contact)
+
+        honest = c.kademlia.relay
+        tampered = []
+
+        async def altering_relay(node, request):
+            reply = await honest(node, request)
+            if request.startswith(b"FIND_VALUE"):
+                message = json.loads(reply.decode())
+                message['value'] = base64.b64encode(b"6.6.6.6").decode()
+                tampered.append(message)
+                reply = json.dumps(message).encode()
+            return reply
+
+        c.kademlia.relay = altering_relay
+        value, _ = await c.kademlia.find_value(key)
+        assert tampered and value is None  # rejected, not 6.6.6.6
+
+        c.kademlia.relay = honest
+        value, _ = await c.kademlia.find_value(key)
+        assert value == "10.1.1.1"
+
+
+@pytest.mark.asyncio
+async def test_reachable_peer_opens_no_channel(tmp_path):
+    async with Network(tmp_path) as net:
+        a = await net.node("a")
+        assert a.relay is not None and a.relay._task is None
+        assert net.server.relay_channels == {}
+
+
+@pytest.mark.asyncio
+async def test_stop_closes_the_relay_channel(tmp_path):
+    async with Network(tmp_path) as net:
+        b = await net.node("b", behind_nat=True)
+        await b.stop()
+        await wait_until(lambda: net.server.relay_channels == {})
+        await b.stop()  # a second stop is harmless
+
+
+@pytest.mark.asyncio
+async def test_cancelling_run_stops_the_node(tmp_path):
+    async with Network(tmp_path) as net:
+        a = await net.node("a")
+        task = asyncio.create_task(a.run())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert a.server is not None and not a.server.is_serving()
+
+
+@pytest.mark.asyncio
+async def test_channel_reconnects_after_the_server_drops_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(relay, "RELAY_RECONNECT_MIN", 0.1)
+    async with Network(tmp_path) as net:
+        b = await net.node("b", behind_nat=True)
+        first = net.server.relay_channels[b.virtual_ip]
+        first.close()
+        await wait_until(lambda: net.server.relay_channels.get(
+            b.virtual_ip) not in (None, first))
+        c = await net.node("c")
+        assert await c.kademlia._exchange(
+            net.contacts(c)[b.virtual_ip], b"PING") == b"PONG"
+
+
+@pytest.mark.asyncio
+async def test_pings_keep_a_quiet_channel_open(tmp_path, monkeypatch):
+    """Between requests the channel carries only pings. With the 10 s
+    per-message READ_TIMEOUT applied to it, it would be torn down and
+    re-opened every time it idled; only silence past RELAY_IDLE_TIMEOUT
+    closes it."""
+    monkeypatch.setattr(kademlia_dht, "READ_TIMEOUT", 0.2)
+    monkeypatch.setattr(relay, "RELAY_PING_INTERVAL", 0.1)
+    monkeypatch.setattr(relay, "RELAY_IDLE_TIMEOUT", 0.6)
+    monkeypatch.setattr(introduction_server, "RELAY_IDLE_TIMEOUT", 0.6)
+    monkeypatch.setattr(relay, "RELAY_RECONNECT_MIN", 0.1)
+    async with Network(tmp_path) as net:
+        b = await net.node("b", behind_nat=True)
+        first = net.server.relay_channels[b.virtual_ip]
+        await asyncio.sleep(1.5)  # 7x READ_TIMEOUT, 2.5x the idle timeout
+        assert net.server.relay_channels[b.virtual_ip] is first
+
+
+@pytest.mark.asyncio
+async def test_a_silent_server_is_noticed_and_the_channel_reopened(
+        tmp_path, monkeypatch):
+    """No pings from us (so no pongs back) for RELAY_IDLE_TIMEOUT: the
+    channel is dropped on both ends and the client registers a new one."""
+    monkeypatch.setattr(relay, "RELAY_PING_INTERVAL", 60)
+    monkeypatch.setattr(relay, "RELAY_IDLE_TIMEOUT", 0.4)
+    monkeypatch.setattr(introduction_server, "RELAY_IDLE_TIMEOUT", 0.4)
+    monkeypatch.setattr(relay, "RELAY_RECONNECT_MIN", 0.1)
+    async with Network(tmp_path) as net:
+        b = await net.node("b", behind_nat=True)
+        first = net.server.relay_channels[b.virtual_ip]
+        await wait_until(lambda: net.server.relay_channels.get(
+            b.virtual_ip) not in (None, first))
+
+
+@pytest.mark.asyncio
+async def test_join_with_a_server_that_has_no_relay_still_works(tmp_path):
+    """An older introduction server (no relay_token, no reachability flag in
+    its reply) is still joinable; there is just no relay."""
+    async def old_server(reader, writer):
+        await reader.read(4096)
+        writer.write(json.dumps(
+            {'virtual_ip': "10.0.0.5", 'nearby_peers': []}).encode())
+        await writer.drain()
+        writer.close()
+
+    srv = await asyncio.start_server(old_server, IP, 0)
+    port = srv.sockets[0].getsockname()[1]
+    node = P2PNode(IP, dead_port(), key_path=str(tmp_path / "n.key"))
+    try:
+        await node.join_network((IP, port))
+        assert node.virtual_ip == "10.0.0.5"
+        assert node.directly_reachable is True and node.relay is None
+        assert node.kademlia.relay is None
+    finally:
+        await close_srv(srv)
+
+
+# RelayClient against a scripted server
+
+async def scripted_server(script):
+    """A server that runs `script(reader, writer)` for each connection."""
+    srv = await asyncio.start_server(script, IP, 0)
+    return srv, srv.sockets[0].getsockname()[1]
+
+
+def frame_of(message):
+    body = json.dumps(message).encode()
+    return len(body).to_bytes(4, "big") + body
+
+
+@pytest.mark.asyncio
+async def test_channel_client_answers_relayed_requests_and_refuses_bad_ones():
+    seen = []
+
+    async def handler(payload):
+        seen.append(payload)
+        if payload == b"boom":
+            raise RuntimeError("handler failed")
+        if payload == b"huge":
+            return b"x" * (MAX_RELAYED_MESSAGE_SIZE + 1)
+        if payload == b"unknown":
+            return None
+        return b"echo:" + payload
+
+    replies = []
+
+    async def server(reader, writer):
+        await reader.read(4096)  # relay_register
+        await write_frame(writer, json.dumps(
+            {'type': 'relay_registered'}).encode())
+        b64 = lambda raw: base64.b64encode(raw).decode()
+        for i, payload in enumerate([b64(b"hi"), b64(b"boom"), b64(b"huge"),
+                                     b64(b"unknown"), "%%% not base64",
+                                     b64(b"x" * (MAX_RELAYED_MESSAGE_SIZE + 1)),
+                                     b64(b"after")]):
+            await write_frame(writer, json.dumps(
+                {'type': 'relayed', 'id': str(i), 'payload': payload}).encode())
+            replies.append(json.loads(
+                (await read_frame(reader, MAX_RELAY_FRAME_SIZE)).decode()))
+        await write_frame(writer, json.dumps({'type': 'weird'}).encode())
+        await write_frame(writer, json.dumps({'type': 'pong'}).encode())
+        await asyncio.sleep(0.2)
+        writer.close()
+
+    srv, port = await scripted_server(server)
+    client = RelayClient((IP, port), "10.0.0.1", "tok", handler)
+    try:
+        await client.start()
+        await wait_until(lambda: len(replies) == 7)
+        assert [r['id'] for r in replies] == [str(i) for i in range(7)]
+        assert base64.b64decode(replies[0]['payload']) == b"echo:hi"
+        for refused in replies[1:6]:
+            assert 'payload' not in refused and 'error' in refused
+        assert base64.b64decode(replies[6]['payload']) == b"echo:after"
+        assert b"x" * (MAX_RELAYED_MESSAGE_SIZE + 1) not in seen
+    finally:
+        await client.stop()
+        await close_srv(srv)
+
+
+@pytest.mark.asyncio
+async def test_channel_client_keeps_retrying_when_registration_is_refused(
+        monkeypatch):
+    monkeypatch.setattr(relay, "RELAY_RECONNECT_MIN", 0.05)
+    monkeypatch.setattr(relay, "RELAY_REGISTER_WAIT", 0.3)
+    attempts = []
+
+    async def server(reader, writer):
+        await reader.read(4096)
+        attempts.append(1)
+        await write_frame(writer, json.dumps(
+            {'type': 'error', 'error': 'unknown virtual ip or bad token'}
+        ).encode())
+        writer.close()
+
+    srv, port = await scripted_server(server)
+
+    async def handler(payload):
+        return b"unused"
+
+    client = RelayClient((IP, port), "10.0.0.1", "bad", handler)
+    try:
+        await client.start()  # returns after RELAY_REGISTER_WAIT, not hung
+        await wait_until(lambda: len(attempts) >= 3)
+    finally:
+        await client.stop()
+        await close_srv(srv)
+    count = len(attempts)
+    await asyncio.sleep(0.3)
+    assert len(attempts) == count  # stop() ended the retries
+
+
+@pytest.mark.asyncio
+async def test_relay_request_gives_none_for_every_kind_of_failure(monkeypatch):
+    monkeypatch.setattr(kademlia_dht, "READ_TIMEOUT", 0.3)
+    monkeypatch.setattr(relay, "RELAY_TIMEOUT", 0.2)
+    behaviours = iter([
+        lambda r, w: write_frame(w, json.dumps(                  # refused
+            {'type': 'relay_failed', 'error': 'nope'}).encode()),
+        lambda r, w: write_frame(w, b"not json"),                 # garbage
+        lambda r, w: asyncio.sleep(2),                            # silent
+    ])
+
+    async def server(reader, writer):
+        await reader.read(4096)
+        try:
+            await next(behaviours)(reader, writer)
+        finally:
+            writer.close()
+
+    srv, port = await scripted_server(server)
+    client = RelayClient((IP, port), "10.0.0.1", "tok", None)
+    try:
+        for _ in range(3):
+            assert await client.request("10.0.0.2", b"PING") is None
+        # A payload over the cap is not even sent.
+        assert await client.request(
+            "10.0.0.2", b"x" * (MAX_RELAYED_MESSAGE_SIZE + 1)) is None
+    finally:
+        await close_srv(srv)
+    # And with the server gone.
+    assert await client.request("10.0.0.2", b"PING") is None
+
+
+@pytest.mark.asyncio
+async def test_relay_request_refuses_a_reply_over_the_cap():
+    async def server(reader, writer):
+        await reader.read(4096)
+        await write_frame(writer, json.dumps({'type': 'relay_ready'}).encode())
+        await read_frame(reader)
+        big = base64.b64encode(b"x" * (MAX_RELAYED_MESSAGE_SIZE + 1)).decode()
+        await write_frame(writer, json.dumps(
+            {'type': 'relay_reply', 'payload': big}).encode())
+        writer.close()
+
+    srv, port = await scripted_server(server)
+    client = RelayClient((IP, port), "10.0.0.1", "tok", None)
+    try:
+        assert await client.request("10.0.0.2", b"PING") is None
+    finally:
+        await close_srv(srv)
