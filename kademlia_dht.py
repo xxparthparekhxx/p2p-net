@@ -197,6 +197,46 @@ async def connect(ip: str, port: int):
         ) from None
 
 
+async def write_frame(writer, data: bytes):
+    """Write one framed message: a 4-byte big-endian length, then the payload."""
+    writer.write(len(data).to_bytes(4, "big") + data)
+    await writer.drain()
+
+
+async def read_frame(reader, max_size: int = MAX_MESSAGE_SIZE,
+                     header_timeout: Optional[float] = None):
+    """Read one framed message, refusing anything over `max_size` bytes.
+
+    The declared length is checked before the body is read, so a peer cannot
+    make us allocate an arbitrarily large buffer. Every read is bounded by
+    READ_TIMEOUT (read at call time), so a peer that stalls mid-message is
+    dropped instead of holding the handler forever. A long-lived connection
+    that is legitimately quiet between messages passes a longer
+    `header_timeout` for the wait for the next message; the body of a message
+    that has started is always bounded by READ_TIMEOUT.
+    """
+    if header_timeout is None:
+        header_timeout = READ_TIMEOUT
+    try:
+        length_bytes = await asyncio.wait_for(
+            reader.readexactly(4), header_timeout
+        )
+    except asyncio.TimeoutError:
+        raise ValueError("Read timeout: header not received in time")
+    length = int.from_bytes(length_bytes, "big")
+    if length > max_size:
+        raise ValueError(
+            f"Rejecting {length}-byte message: over the "
+            f"{max_size}-byte cap"
+        )
+    try:
+        return await asyncio.wait_for(
+            reader.readexactly(length), READ_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        raise ValueError("Read timeout: body not received in time")
+
+
 def sha1_hash(data: str) -> int:
     return int(hashlib.sha1(data.encode()).hexdigest(), 16)
 
@@ -419,29 +459,10 @@ class KademliaProtocol:
         self.kademlia_node = kademlia_node
 
     async def _send_message(self, writer, data: bytes):
-        length = len(data).to_bytes(4, "big")
-        writer.write(length + data)
-        await writer.drain()
+        await write_frame(writer, data)
 
     async def _read_message(self, reader):
-        try:
-            length_bytes = await asyncio.wait_for(
-                reader.readexactly(4), READ_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            raise ValueError("Read timeout: header not received in time")
-        length = int.from_bytes(length_bytes, "big")
-        if length > MAX_MESSAGE_SIZE:
-            raise ValueError(
-                f"Rejecting {length}-byte message: over the "
-                f"{MAX_MESSAGE_SIZE}-byte cap"
-            )
-        try:
-            return await asyncio.wait_for(
-                reader.readexactly(length), READ_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            raise ValueError("Read timeout: body not received in time")
+        return await read_frame(reader)
 
     async def ping(self, writer):
         await self._send_message(writer, b"PING")
