@@ -7,6 +7,7 @@ import pytest
 
 import introduction_server
 import kademlia_dht
+import p2p_node
 import relay
 from introduction_server import IntroductionServer
 from kademlia_dht import (
@@ -1171,3 +1172,69 @@ async def test_relay_request_refuses_a_reply_over_the_cap():
         assert await client.request("10.0.0.2", b"PING") is None
     finally:
         await close_srv(srv)
+
+
+# --- Joining: the join reply ---
+
+
+async def join_against(tmp_path, script):
+    """Join a node to a scripted introduction server; returns the node."""
+    srv, port = await scripted_server(script)
+    node = P2PNode(IP, dead_port(), key_path=str(tmp_path / "n.key"))
+    try:
+        await asyncio.wait_for(node.join_network((IP, port)), 10)
+    finally:
+        await close_srv(srv)
+    return node
+
+
+@pytest.mark.asyncio
+async def test_join_reply_is_read_in_full_when_it_arrives_in_pieces(tmp_path):
+    """One read() can return just the first TCP segment of the reply; the
+    reply is read until the server closes the connection."""
+    reply = json.dumps({'virtual_ip': "10.0.0.9", 'nearby_peers': [],
+                        'padding': "x" * 6000}).encode()
+
+    async def server(reader, writer):
+        await reader.read(4096)
+        writer.write(reply[:100])
+        await writer.drain()
+        await asyncio.sleep(0.1)
+        writer.write(reply[100:])
+        await writer.drain()
+        writer.close()
+
+    node = await join_against(tmp_path, server)
+    assert node.virtual_ip == "10.0.0.9"
+
+
+@pytest.mark.asyncio
+async def test_join_reply_that_never_ends_times_out(tmp_path, monkeypatch,
+                                                    capsys):
+    monkeypatch.setattr(p2p_node, "READ_TIMEOUT", 0.3)
+
+    async def server(reader, writer):
+        await reader.read(4096)
+        writer.write(b'{"virtual_ip": "10.0.0')
+        await writer.drain()
+        try:
+            await reader.read()  # until the node gives up and hangs up
+        finally:
+            writer.close()
+
+    node = await join_against(tmp_path, server)
+    assert node.virtual_ip is None
+    assert "join reply not received in time" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_join_reply_over_the_size_cap_is_refused(tmp_path, capsys):
+    async def server(reader, writer):
+        await reader.read(4096)
+        writer.write(b" " * (p2p_node.MAX_JOIN_REPLY_SIZE + 10))
+        await writer.drain()
+        writer.close()
+
+    node = await join_against(tmp_path, server)
+    assert node.virtual_ip is None
+    assert "join reply is over" in capsys.readouterr().out

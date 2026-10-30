@@ -11,6 +11,7 @@ from kademlia_dht import (
     ED25519_PUBLIC_KEY_SIZE,
     KademliaNode,
     Node,
+    READ_TIMEOUT,
     connect,
     safe_text,
     sha1_hash,
@@ -59,6 +60,31 @@ def load_owner_pins(path: str) -> Dict[str, bytes]:
                              f"{safe_text(domain)} is not a base64 Ed25519 key")
         pins[domain] = owner
     return pins
+
+
+# The join reply is one JSON object that the server follows by closing the
+# connection; it is read to the end, up to this many bytes.
+MAX_JOIN_REPLY_SIZE = 64 * 1024
+
+
+async def read_join_reply(reader) -> bytes:
+    """The introduction server's whole join reply. One read() can return just
+    the first TCP segment of it, and the reply grows with the peers it lists,
+    so read until the server closes the connection (bounded by READ_TIMEOUT
+    and MAX_JOIN_REPLY_SIZE)."""
+    async def read_all():
+        data = b""
+        while True:
+            chunk = await reader.read(4096)
+            if not chunk:
+                return data
+            data += chunk
+            if len(data) > MAX_JOIN_REPLY_SIZE:
+                raise ValueError(f"join reply is over {MAX_JOIN_REPLY_SIZE} bytes")
+    try:
+        return await asyncio.wait_for(read_all(), READ_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise ValueError("Read timeout: join reply not received in time")
 
 
 def is_loopback(ip: str) -> bool:
@@ -143,8 +169,7 @@ class P2PNode:
             # The introduction server no longer ships a plaintext network key.
             # The response is plain JSON: records are authenticated by Ed25519
             # signatures on STORE rather than a shared symmetric key.
-            response_data = await reader.read(4096)
-            response = json.loads(response_data.decode())
+            response = json.loads((await read_join_reply(reader)).decode())
 
             self.virtual_ip = response['virtual_ip']
             self.observed_address = response.get('observed_address')
