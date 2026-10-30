@@ -377,12 +377,25 @@ def select_record(key: int, replies: List[Tuple[Replica, VerifiedRecord]]
     return max(by_owner[owner].values(), key=lambda r: (r.seq, r.value))
 
 
+def node_entry(node: "Node") -> dict:
+    """The JSON form of a contact in a FIND_NODE / FIND_VALUE reply. The NAT
+    fields are included when known, so contact lists carry the reachability
+    flag alongside the address."""
+    entry = {'id': node.id, 'ip': node.ip, 'port': node.port}
+    if node.reachable is not None:
+        entry['reachable'] = node.reachable
+    if node.virtual_ip is not None:
+        entry['virtual_ip'] = node.virtual_ip
+    return entry
+
+
 def parse_node_list(entries) -> List["Node"]:
     """Turn an untrusted JSON node list into Node objects, or raise ValueError.
 
     Ids must be ints in [0, 2**ID_BITS), ips strings and ports ints in
     1..65535; a string or list id would otherwise raise later in the lookup's
-    XOR sort or set(), outside any try block.
+    XOR sort or set(), outside any try block. The optional NAT fields
+    ('reachable' bool, 'virtual_ip' string) are carried onto the Node.
     """
     if not isinstance(entries, list):
         raise ValueError("node list is not a list")
@@ -397,16 +410,32 @@ def parse_node_list(entries) -> List["Node"]:
             raise ValueError("node ip is not a string")
         if not (_is_int(port) and 0 < port < 65536):
             raise ValueError("node port is not a valid port")
-        nodes.append(Node(node_id, ip, port))
+        reachable = n.get('reachable')
+        if reachable is not None and not isinstance(reachable, bool):
+            raise ValueError("reachable is not a bool")
+        virtual_ip = n.get('virtual_ip')
+        if virtual_ip is not None and not isinstance(virtual_ip, str):
+            raise ValueError("virtual ip is not a string")
+        nodes.append(Node(node_id, ip, port, reachable=reachable,
+                          virtual_ip=virtual_ip))
     return nodes
 
 
 class Node:
-    def __init__(self, id: int, ip: str, port: int, public_key: bytes = None):
+    def __init__(self, id: int, ip: str, port: int, public_key: bytes = None,
+                 reachable: Optional[bool] = None,
+                 virtual_ip: Optional[str] = None):
         self.id = id
         self.ip = ip
         self.port = port
         self.public_key = public_key
+        # NAT traversal: whether the introduction server could dial this
+        # contact back at its advertised address, and the contact's virtual
+        # ip (the address relay requests to it are addressed by). Both are
+        # None when unknown (e.g. a contact learned from a FIND_NODE reply
+        # before this node joined the introduction server).
+        self.reachable = reachable
+        self.virtual_ip = virtual_ip
 
     def __eq__(self, other):
         return self.id == other.id
@@ -467,8 +496,8 @@ class KademliaProtocol:
     async def ping(self, writer):
         await self._send_message(writer, b"PING")
 
-    async def store(self, writer, key: int, value: str, seq: int = None,
-                    signature: bytes = None):
+    def store_payload(self, key: int, value: str, seq: int = None,
+                      signature: bytes = None) -> bytes:
         # Sign a domain-separated message covering key, sequence number and
         # value, with the value carried base64-encoded so values of any bytes
         # (including spaces and the empty string) round-trip exactly. A caller
@@ -483,13 +512,18 @@ class KademliaProtocol:
             raise ValueError("a prebuilt signature needs the seq it signs")
         public_key_bytes = self.kademlia_node.owner_public_key
 
-        payload = (
+        return (
             f"STOR {key} {seq} "
             f"{base64.b64encode(value_bytes).decode()} "
             f"{base64.b64encode(public_key_bytes).decode()} "
             f"{base64.b64encode(signature).decode()}"
         ).encode()
-        await self._send_message(writer, payload)
+
+    async def store(self, writer, key: int, value: str, seq: int = None,
+                    signature: bytes = None):
+        await self._send_message(
+            writer, self.store_payload(key, value, seq, signature)
+        )
 
     async def find_node(self, writer, target_id: int):
         message = f"FIND_NODE {target_id}".encode()
@@ -499,10 +533,10 @@ class KademliaProtocol:
         message = f"FIND_VALUE {key}".encode()
         await self._send_message(writer, message)
 
-    async def handle_ping(self, writer):
-        await self._send_message(writer, b"PONG")
+    async def handle_ping(self) -> bytes:
+        return b"PONG"
 
-    async def handle_store(self, writer, payload: bytes):
+    async def handle_store(self, payload: bytes) -> bytes:
         # payload: b"STOR <key> <seq> <base64 value> <base64 public_key>
         #          <base64 signature>"  (exactly five space-separated tokens
         #          after STOR; the value is base64 so any bytes round-trip).
@@ -523,44 +557,39 @@ class KademliaProtocol:
             signature = base64.b64decode(signature_b64)
         except Exception:
             print("Rejecting malformed STORE: missing or invalid fields")
-            await self._send_message(writer, b"REJECTED")
-            return
+            return b"REJECTED"
 
         if len(value_bytes) > MAX_VALUE_SIZE:
             print(f"Rejecting STORE: value for key {key} is "
                   f"{len(value_bytes)} bytes, over {MAX_VALUE_SIZE}")
-            await self._send_message(writer, b"REJECTED")
-            return
+            return b"REJECTED"
 
         if not valid_seq(seq):
             print(f"Rejecting STORE: seq for key {key} is not an unsigned "
                   f"64-bit integer")
-            await self._send_message(writer, b"REJECTED")
-            return
+            return b"REJECTED"
 
         try:
             public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
         except Exception:
             print("Rejecting STORE: public key is not a valid Ed25519 key")
-            await self._send_message(writer, b"REJECTED")
-            return
+            return b"REJECTED"
 
         try:
             public_key.verify(signature, record_message(key, seq, value_bytes))
         except InvalidSignature:
             print(f"Rejecting STORE: bad signature for key {key}")
-            await self._send_message(writer, b"REJECTED")
-            return
+            return b"REJECTED"
 
         accepted, message = self.kademlia_node.put_record(
             key, public_key_bytes, seq, value, signature
         )
         if accepted:
             print(message)
-            await self._send_message(writer, b"OK")
+            return b"OK"
         else:
             print(f"Rejecting STORE: {message}")
-            await self._send_message(writer, b"REJECTED")
+            return b"REJECTED"
 
     @staticmethod
     def _parse_id_request(payload: bytes, command: str) -> Optional[int]:
@@ -580,27 +609,24 @@ class KademliaProtocol:
             return None
         return target
 
-    async def handle_find_node(self, writer, payload: bytes):
+    async def handle_find_node(self, payload: bytes) -> bytes:
         # payload: b"FIND_NODE <target_id>"
         target_id = self._parse_id_request(payload, "FIND_NODE")
         if target_id is None:
             print("Malformed FIND_NODE request: replying with no nodes")
-            await self._send_message(writer, b"[]")
-            return
+            return b"[]"
         closest_nodes = self.kademlia_node.routing_table.find_closest(target_id)
         response = json.dumps(
-            [{'id': node.id, 'ip': node.ip, 'port': node.port}
-             for node in closest_nodes]
+            [node_entry(node) for node in closest_nodes]
         ).encode()
-        await self._send_message(writer, response)
+        return response
 
-    async def handle_find_value(self, writer, payload: bytes):
+    async def handle_find_value(self, payload: bytes) -> bytes:
         # payload: b"FIND_VALUE <key>"
         key = self._parse_id_request(payload, "FIND_VALUE")
         if key is None:
             print("Malformed FIND_VALUE request: replying with no nodes")
-            await self._send_message(writer, json.dumps({'nodes': []}).encode())
-            return
+            return json.dumps({'nodes': []}).encode()
         if key in self.kademlia_node.data:
             # Return the whole signed record (key, seq, value, owner public
             # key and signature) so the caller can verify it on its own; this
@@ -618,10 +644,9 @@ class KademliaProtocol:
         else:
             closest_nodes = self.kademlia_node.routing_table.find_closest(key)
             response = json.dumps(
-                {'nodes': [{'id': node.id, 'ip': node.ip, 'port': node.port}
-                           for node in closest_nodes]}
+                {'nodes': [node_entry(node) for node in closest_nodes]}
             )
-        await self._send_message(writer, response.encode())
+        return response.encode()
 
 
 class KademliaNode:
@@ -897,14 +922,9 @@ class KademliaNode:
             return
 
         try:
-            if data == b"PING":
-                await self.protocol.handle_ping(writer)
-            elif data[:5] == b"STOR ":
-                await self.protocol.handle_store(writer, data)
-            elif data[:9] == b"FIND_NODE":
-                await self.protocol.handle_find_node(writer, data)
-            elif data[:10] == b"FIND_VALUE":
-                await self.protocol.handle_find_value(writer, data)
+            reply = await self.dispatch(data)
+            if reply is not None:
+                await self.protocol._send_message(writer, reply)
         except Exception as e:
             # E.g. the peer hung up before the reply was written: log it and
             # close instead of leaving an unhandled exception in the server.
@@ -915,3 +935,21 @@ class KademliaNode:
                 await writer.wait_closed()
             except Exception:
                 pass
+
+    async def dispatch(self, data: bytes) -> Optional[bytes]:
+        """Handle one framed request payload and return the framed reply
+        (None for an unknown command: the caller then sends nothing).
+
+        Split out of handle_connection so a relayed message (which arrives
+        over the introduction server's relay channel, not a TCP connection to
+        this node) can be answered the same way.
+        """
+        if data == b"PING":
+            return await self.protocol.handle_ping()
+        if data[:5] == b"STOR ":
+            return await self.protocol.handle_store(data)
+        if data[:9] == b"FIND_NODE":
+            return await self.protocol.handle_find_node(data)
+        if data[:10] == b"FIND_VALUE":
+            return await self.protocol.handle_find_value(data)
+        return None
