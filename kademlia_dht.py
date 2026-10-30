@@ -651,7 +651,7 @@ class KademliaProtocol:
 
 class KademliaNode:
     def __init__(self, id: int, ip: str, port: int,
-                 key_path: Optional[str] = None):
+                 key_path: Optional[str] = None, relay=None):
         self.id = id
         self.ip = ip
         self.port = port
@@ -674,6 +674,11 @@ class KademliaNode:
             Encoding.Raw, PublicFormat.Raw
         )
         self.protocol = KademliaProtocol(id, self)
+        # Optional NAT-traversal hook: an async callable (Node, bytes) ->
+        # reply bytes (or None), used by _exchange when a contact cannot be
+        # dialed directly. P2PNode sets it to its introduction-server relay;
+        # a bare KademliaNode has no relay and only dials directly.
+        self.relay = relay
 
     def sign_record(self, key: int, seq: int, value_bytes: bytes) -> bytes:
         return self.signing_key.sign(record_message(key, seq, value_bytes))
@@ -714,19 +719,65 @@ class KademliaNode:
         for node in bootstrap_nodes:
             await self.ping(node)
 
-    async def ping(self, node: Node):
+    async def _exchange(self, node: Node, request: bytes) -> Optional[bytes]:
+        """One framed request/reply with `node`, or None if there is no reply.
+
+        A contact is dialed directly, and if the connection cannot be made
+        (it is behind a NAT that refuses inbound connections) the request
+        goes through the relay hook instead, which asks the introduction
+        server to forward it over the contact's persistent relay connection.
+        The relay needs the contact's virtual ip. A contact the introduction
+        server already found unreachable (reachable is False) is relayed
+        first, since dialing it would only wait out CONNECT_TIMEOUT; the
+        direct dial is then its fallback (e.g. a peer on the same LAN).
+        A contact that accepted the connection but did not answer is not
+        retried through the relay: the relay could not help.
+        """
+        can_relay = self.relay is not None and node.virtual_ip is not None
+        relay_first = can_relay and node.reachable is False
+        if relay_first:
+            response = await self._relay_exchange(node, request)
+            if response is not None:
+                return response
         try:
             reader, writer = await connect(node.ip, node.port)
-            await self.protocol.ping(writer)
-            response = await self.protocol._read_message(reader)
-            if response == b"PONG":
-                self.routing_table.add(node)
-                print(f"Successfully pinged and added node {node.id}")
-            writer.close()
-            await writer.wait_closed()
         except Exception as e:
+            print(f"Direct connection to node {node.id} "
+                  f"({safe_text(node.ip)} port {node.port}) failed: {e}")
+            if can_relay and not relay_first:
+                return await self._relay_exchange(node, request)
+            return None
+        try:
+            await write_frame(writer, request)
+            return await read_frame(reader)
+        except Exception as e:
+            print(f"No reply from node {node.id} "
+                  f"({safe_text(node.ip)} port {node.port}): {e}")
+            return None
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _relay_exchange(self, node: Node, request: bytes
+                              ) -> Optional[bytes]:
+        try:
+            return await self.relay(node, request)
+        except Exception as e:
+            print(f"Relay to node {node.id} at virtual ip "
+                  f"{safe_text(node.virtual_ip)} failed: {e}")
+            return None
+
+    async def ping(self, node: Node):
+        response = await self._exchange(node, b"PING")
+        if response == b"PONG":
+            self.routing_table.add(node)
+            print(f"Successfully pinged and added node {node.id}")
+        else:
             print(f"Failed to ping node {node.id} : Tried Pinging "
-                  f"{safe_text(node.ip)} port {node.port} : {e}")
+                  f"{safe_text(node.ip)} port {node.port} : no PONG")
 
     async def store(self, key: int, value: str):
         # One seq and one signature for this store op, carried unchanged to
@@ -761,19 +812,13 @@ class KademliaNode:
 
     async def _store_on_node(self, node: Node, key: int, value: str, seq: int,
                              signature: bytes = None):
-        try:
-            reader, writer = await connect(node.ip, node.port)
-            await self.protocol.store(writer, key, value, seq, signature)
-            response = await self.protocol._read_message(reader)
-            if response == b"OK":
-                print(f"Successfully stored value {safe_text(value)} on node {node.id}")
-            else:
-                print(f"Failed to store value {safe_text(value)} on node "
-                      f"{node.id}: {safe_text(response)}")
-            writer.close()
-            await writer.wait_closed()
-        except Exception as e:
-            print(f"Failed to store key {key} on node {node.id}: {e}")
+        request = self.protocol.store_payload(key, value, seq, signature)
+        response = await self._exchange(node, request)
+        if response == b"OK":
+            print(f"Successfully stored value {safe_text(value)} on node {node.id}")
+        else:
+            print(f"Failed to store value {safe_text(value)} on node "
+                  f"{node.id}: {safe_text(response)}")
 
     async def find_node(self, target_id: int) -> List[Node]:
         nodes = self.routing_table.find_closest(target_id)
@@ -795,15 +840,13 @@ class KademliaNode:
         return nodes
 
     async def _find_node_on_node(self, node: Node, target_id: int) -> List[Node]:
+        response = await self._exchange(node, f"FIND_NODE {target_id}".encode())
+        if response is None:
+            return []
         try:
-            reader, writer = await connect(node.ip, node.port)
-            await self.protocol.find_node(writer, target_id)
-            response = await self.protocol._read_message(reader)
-            writer.close()
-            await writer.wait_closed()
             return parse_node_list(json.loads(response.decode()))
         except Exception as e:
-            print(f"Failed to find_node on {node.id}: {e}")
+            print(f"Rejecting FIND_NODE reply from node {node.id}: {e}")
             return []
 
     async def find_value(
@@ -874,16 +917,9 @@ class KademliaNode:
     async def _find_value_on_node(
         self, node: Node, key: int, expected_owner: Optional[bytes] = None
     ) -> Union[VerifiedRecord, List[Node], None]:
-        try:
-            reader, writer = await connect(node.ip, node.port)
-            try:
-                await self.protocol.find_value(writer, key)
-                response = await self.protocol._read_message(reader)
-            finally:
-                writer.close()
-                await writer.wait_closed()
-        except Exception as e:
-            print(f"Failed to find_value on {node.id}: {e}")
+        response = await self._exchange(node, f"FIND_VALUE {key}".encode())
+        if response is None:
+            print(f"Failed to find_value on {node.id}: no reply")
             return None
 
         # The reply is untrusted. A record must verify against the owner key

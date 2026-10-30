@@ -12,6 +12,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
+import kademlia_dht
 from kademlia_dht import (
     KademliaNode,
     Node,
@@ -1391,3 +1392,128 @@ def test_select_record_policy():
     replies = [(local, _record(a, key, 1, "a")), (r1, _record(a, key, 1, "a")),
                (r2, _record(b, key, 7, "b"))]
     assert select_record(key, replies).value == "a"
+
+
+# --- _exchange: direct dial, then the relay hook ---
+
+
+def dead_port():
+    """A 127.0.0.1 port nothing listens on (bound, then released)."""
+    with socket.socket() as s:
+        s.bind((IP, 0))
+        return s.getsockname()[1]
+
+
+def fake_relay(reply=b"PONG", error=None):
+    """A relay hook that records its calls; returns `reply` or raises."""
+    calls = []
+
+    async def relay(node, request):
+        calls.append((node, request))
+        if error is not None:
+            raise error
+        return reply
+
+    relay.calls = calls
+    return relay
+
+
+@pytest.mark.asyncio
+async def test_exchange_dials_directly_and_skips_the_relay():
+    client, server_node = make_node(1), make_node(2)
+    server = await start_node(server_node)
+    client.relay = fake_relay()
+    try:
+        contact = Node(2, IP, server_node.port, virtual_ip="10.0.0.2")
+        assert await client._exchange(contact, b"PING") == b"PONG"
+        assert client.relay.calls == []
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_exchange_falls_back_to_the_relay_when_the_dial_fails():
+    client = make_node(1)
+    client.relay = fake_relay(b"PONG")
+    contact = Node(2, IP, dead_port(), virtual_ip="10.0.0.2")
+    assert await client._exchange(contact, b"PING") == b"PONG"
+    assert client.relay.calls == [(contact, b"PING")]
+
+    # ping() goes through _exchange, so a relayed PONG adds the contact.
+    await client.ping(contact)
+    assert contact in client.routing_table.buckets[
+        ID_BITS - (client.id ^ contact.id).bit_length() - 1].nodes
+
+
+@pytest.mark.asyncio
+async def test_exchange_without_relay_or_virtual_ip_gets_no_reply():
+    client = make_node(1)
+    contact = Node(2, IP, dead_port(), virtual_ip="10.0.0.2")
+    assert await client._exchange(contact, b"PING") is None  # no relay hook
+    client.relay = fake_relay()
+    no_vip = Node(3, IP, dead_port())
+    assert await client._exchange(no_vip, b"PING") is None
+    assert client.relay.calls == []
+
+
+@pytest.mark.asyncio
+async def test_exchange_survives_a_failing_relay():
+    client = make_node(1)
+    client.relay = fake_relay(error=RuntimeError("relay is down"))
+    contact = Node(2, IP, dead_port(), virtual_ip="10.0.0.2")
+    assert await client._exchange(contact, b"PING") is None
+    assert len(client.relay.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_unreachable_contact_is_relayed_first(monkeypatch):
+    """A contact flagged unreachable is not dialed when the relay answers,
+    so a NAT that drops SYNs doesn't cost CONNECT_TIMEOUT per request; the
+    direct dial is only the fallback."""
+    dialed = []
+    real_connect = kademlia_dht.connect
+
+    async def spy_connect(ip, port):
+        dialed.append((ip, port))
+        return await real_connect(ip, port)
+
+    monkeypatch.setattr(kademlia_dht, "connect", spy_connect)
+    client, server_node = make_node(1), make_node(2)
+    server = await start_node(server_node)
+    try:
+        contact = Node(2, IP, server_node.port, reachable=False,
+                       virtual_ip="10.0.0.2")
+        client.relay = fake_relay(b"PONG")
+        assert await client._exchange(contact, b"PING") == b"PONG"
+        assert dialed == []
+
+        # Relay has nothing (peer offline): fall back to dialing directly.
+        client.relay = fake_relay(None)
+        assert await client._exchange(contact, b"PING") == b"PONG"
+        assert dialed == [(IP, server_node.port)]
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_exchange_does_not_relay_after_an_accepted_connection(monkeypatch):
+    """A contact that accepts the connection but never answers is not
+    retried through the relay (it is reachable; a relay would not help)."""
+    monkeypatch.setattr(kademlia_dht, "READ_TIMEOUT", 0.3)
+
+    async def silent(reader, writer):
+        await asyncio.sleep(5)
+
+    server = await asyncio.start_server(silent, IP, 0)
+    port = server.sockets[0].getsockname()[1]
+    client = make_node(1)
+    client.relay = fake_relay()
+    try:
+        contact = Node(2, IP, port, virtual_ip="10.0.0.2")
+        assert await client._exchange(contact, b"PING") is None
+        assert client.relay.calls == []
+    finally:
+        server.close()
+        await server.wait_closed()
