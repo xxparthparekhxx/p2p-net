@@ -17,7 +17,9 @@ from kademlia_dht import (
     sha1_hash,
     write_private_file,
 )
+from punch import PunchClient
 from relay import RelayClient
+from stun import DEFAULT_TCP_SERVERS, ENDPOINT_DEPENDENT, detect_mapping
 from upnp import UPnPMapping
 
 
@@ -96,7 +98,8 @@ def is_loopback(ip: str) -> bool:
 
 class P2PNode:
     def __init__(self, ip: str, port: int, key_path: Optional[str] = None,
-                 upnp: bool = True):
+                 upnp: bool = True, hole_punching: bool = False,
+                 stun: bool = False, stun_servers: Optional[list] = None):
         self.ip = ip
         self.port = port
         self.id = sha1_hash(f"{ip}:{port}")
@@ -117,6 +120,21 @@ class P2PNode:
         # and stop() removes it.
         self.use_upnp = upnp
         self.upnp = None
+        # Optional TCP hole punching (punch.py) and STUN mapping test
+        # (stun.py), both off unless asked for; join_network starts them. The
+        # test asks STUN servers (default: stun.DEFAULT_TCP_SERVERS, which
+        # needs two at different IPs to answer) whether the NAT maps the
+        # listening port the same way for every destination: nat_mapping is
+        # stun.ENDPOINT_INDEPENDENT, ENDPOINT_DEPENDENT or UNKNOWN (None if
+        # not run) and stun_address the listening port as they saw it. Both
+        # features connect out from the listening port, which needs
+        # SO_REUSEPORT on the listener; start() sets it when either is on.
+        self.hole_punching = hole_punching
+        self.stun = stun
+        self.stun_servers = stun_servers
+        self.nat_mapping = None
+        self.stun_address = None
+        self.punch = None
         # Client-side owner pins: domain -> owner public key, recorded the
         # first time a name resolves and enforced on every later lookup. They
         # are saved (0600) next to the key file so they survive restarts.
@@ -186,8 +204,12 @@ class P2PNode:
                 for peer in response['nearby_peers']
             ]
 
+            if self.stun and not self.directly_reachable:
+                await self._detect_nat_mapping()
+
             if response.get('relay_token') is not None:
-                await self._start_relay(response['relay_token'])
+                await self._start_relay(response['relay_token'],
+                                        bool(response.get('punch_supported')))
 
             if bootstrap_nodes:
                 await self.kademlia.bootstrap(bootstrap_nodes)
@@ -205,25 +227,83 @@ class P2PNode:
             writer.close()
             await writer.wait_closed()
 
-    async def _start_relay(self, token: str):
+    async def _detect_nat_mapping(self):
+        """Ask STUN servers, from the listening port, whether our NAT gives
+        every destination the same external port. Fails soft: with no usable
+        answer the mapping stays unknown and the node carries on with what
+        the introduction server reported."""
+        try:
+            result = await detect_mapping(
+                self.stun_servers or DEFAULT_TCP_SERVERS, "tcp",
+                (self.ip, self.port))
+        except Exception as e:
+            print(f"STUN mapping test failed: {e}")
+            return
+        self.nat_mapping = result.mapping
+        self.stun_address = result.address
+        print(f"STUN: NAT mapping is {result.mapping}"
+              + (f"; the listening port is seen as "
+                 f"{safe_text(result.address)}" if result.address else ""))
+
+    async def _start_relay(self, token: str, punch_supported: bool = False):
         """Set up the relay: DHT requests to contacts we can't dial go
         through the introduction server, and if the server could not dial us
-        back either, keep a channel open so peers can reach us the same way."""
+        back either, keep a channel open so peers can reach us the same way.
+        With hole punching on (and a server that coordinates it), requests
+        first try a punched connection, and the channel carries the server's
+        punch_go frames."""
         if self.relay is not None:
             await self.relay.stop()
-        self.relay = RelayClient(self.intro_server_address, self.virtual_ip,
-                                 token, self.kademlia.dispatch)
+        await self._stop_punch()
+        punching = self._punching_possible(punch_supported)
+        # A punching peer opens its channel from the listening port: the
+        # address the server sees it at is then where a punch connects to.
+        self.relay = RelayClient(
+            self.intro_server_address, self.virtual_ip, token,
+            self.kademlia.dispatch,
+            local_addr=(self.ip, self.port) if punching else None)
         self.kademlia.relay = self._relay_rpc
+        if punching:
+            self.punch = PunchClient(
+                self.intro_server_address, self.virtual_ip, token,
+                (self.ip, self.port), self.kademlia.dispatch)
+            self.kademlia.punch = self.punch.request
+            self.kademlia.punch_accept = self.punch.accept
+            self.relay.punch_handler = self.punch.handle_go
         if not self.directly_reachable:
             print("Not directly reachable; opening a relay channel")
             await self.relay.start()
+
+    def _punching_possible(self, punch_supported: bool) -> bool:
+        if not self.hole_punching:
+            return False
+        if not punch_supported:
+            print("The introduction server does not coordinate hole "
+                  "punching; using the relay")
+        elif self.port == 0:
+            print("Hole punching needs a fixed listening port, not port 0")
+        elif self.nat_mapping == ENDPOINT_DEPENDENT:
+            print("Not hole punching: the NAT gives each destination its own "
+                  "port, so a peer could not be told where to connect; "
+                  "using the relay")
+        else:
+            return True
+        return False
+
+    async def _stop_punch(self):
+        if self.punch is not None:
+            await self.punch.stop()
+            self.punch = None
+        self.kademlia.punch = None
+        self.kademlia.punch_accept = None
 
     async def _relay_rpc(self, node: Node, request: bytes) -> Optional[bytes]:
         return await self.relay.request(node.virtual_ip, request)
 
     async def stop(self):
-        """Close the relay channel, remove the UPnP mapping and stop
-        listening."""
+        """Close the punched connections and the relay channel, remove the
+        UPnP mapping and stop listening."""
+        await self._stop_punch()
         if self.relay is not None:
             await self.relay.stop()
         if self.upnp is not None:
@@ -273,7 +353,8 @@ class P2PNode:
 
     async def start(self):
         self.server = await asyncio.start_server(
-            self.kademlia.handle_connection, self.ip, self.port
+            self.kademlia.handle_connection, self.ip, self.port,
+            reuse_port=True if (self.hole_punching or self.stun) else None
         )
         print(f"P2P node listening on {self.ip}:{self.port}")
         if self.use_upnp and not is_loopback(self.ip):
