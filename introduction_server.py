@@ -29,11 +29,12 @@ VIRTUAL_NETWORK = "10.0.0.0/8"
 
 # Relay (NAT fallback) limits; the protocol itself is described in relay.py.
 # Relayed messages in flight (waiting for the peer's reply), per sender, per
-# destination and in total. Each holds up to 1 MB in a connection buffer, so
-# these bound the memory a flood of relays can pin.
+# destination and in total. Each holds up to 1 MB in a connection buffer
+# (about 3.5 MB while it is base64-encoded and framed for the destination),
+# so the total bounds the memory a flood of relays can pin to a few hundred MB.
 MAX_PENDING_RELAYS_PER_SENDER = 8
 MAX_PENDING_RELAYS_PER_PEER = 16
-MAX_PENDING_RELAYS = 256
+MAX_PENDING_RELAYS = 64
 # Per-sender rate limit: relay requests per virtual ip per window.
 RELAY_RATE_LIMIT = 50
 RELAY_RATE_WINDOW = 1.0
