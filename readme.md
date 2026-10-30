@@ -32,7 +32,7 @@ This protocol is designed to serve as the foundational layer for a distributed n
 Key Features:
 - **Decentralized Domain Name Resolution:** A P2P approach to DNS that ensures scalability and robustness.
 - **Direct Peer Communication:** Reduces network load by facilitating direct client-server interactions.
-- **NAT Traversal (partial):** the introduction server reports each peer's observed address, checks whether the peer accepts inbound connections, and relays DHT messages to peers that do not. Optional UPnP port mapping. TCP hole punching is not implemented (see [NAT Traversal](#nat-traversal)).
+- **NAT Traversal (partial):** the introduction server reports each peer's observed address, checks whether the peer accepts inbound connections, and relays DHT messages to peers that do not. Optional UPnP port mapping, optional STUN (a NAT mapping test) and optional TCP hole punching. Hole punching has been tested only on one machine in simulation, never through a real NAT (see [NAT Traversal](#nat-traversal)).
 
 ## **Architecture Overview**
 
@@ -77,7 +77,7 @@ Peer connections follow this process:
 
 ### **NAT Traversal**
 
-A peer behind a NAT that refuses inbound connections can still make outgoing connections, but other peers cannot dial it. The code handles that in four parts; the table at the end of the section says what is and is not done.
+A peer behind a NAT that refuses inbound connections can still make outgoing connections, but other peers cannot dial it. The code handles that in six parts; the table at the end of the section says what is and is not done. Hole punching and STUN are off unless a node is created with `hole_punching=True` / `stun=True`.
 
 1. **Reflexive address discovery.** When a peer joins, the Introduction Server records the address it sees the join connection come from and returns it as `observed_address` (`{"ip", "port"}`); `P2PNode.observed_address` holds it and `join_network` prints it. This is the address of the join connection, which a NAT usually gives a different external port than the listening port. It is only reported: the node still advertises the `ip` and `port` it was constructed with, and its node id is derived from them.
 2. **Reachability check.** After a join the server dials the peer's advertised listening address (bounded by `CONNECT_TIMEOUT`) and returns `directly_reachable`. It only dials the IP the peer connected from, so it cannot be used to make the server connect to arbitrary hosts; a peer that advertises a different IP (for example a LAN address behind a NAT) is reported as not reachable without any connection attempt. The flag is kept with the peer, handed out to later joiners in `nearby_peers` (as `reachable`, together with the peer's `virtual_ip`), and passed along in FIND_NODE / FIND_VALUE contact lists as the optional fields `reachable` and `virtual_ip`.
@@ -102,16 +102,57 @@ A peer behind a NAT that refuses inbound connections can still make outgoing con
    - **Metadata is not authenticated.** `reachable` and `virtual_ip` in a contact list come from the peer that sent it. A lying peer can point a contact at another peer's virtual ip, so requests meant for the contact go to that peer; it can waste relay capacity but not forge records.
 4. **UPnP (optional).** If the `miniupnpc` Python package is importable (`pip install miniupnpc`; it is not in `requirements.txt`), `P2PNode.start()` asks the router to forward the node's listening TCP port to this host and `stop()` (which `run()` calls on exit) removes the mapping. A missing package is ignored silently; a router without UPnP, or one that refuses or does not answer, is logged and ignored. The router calls run in a worker thread with a 10 s timeout. A node listening on loopback does not try, and `P2PNode(..., upnp=False)` turns it off. The mapping has no lease time, so a node that is killed without stopping leaves it on the router. The node still advertises the `ip` it was constructed with, and the reachability check only accepts the IP the peer connected from, so UPnP alone does not make a node constructed with a LAN address count as reachable: that node is still reported as not reachable and keeps a relay channel.
 
+5. **STUN (optional, `P2PNode(..., stun=True)`).** `stun.py` is a STUN client (RFC 8489, standard library only) that sends Binding requests over UDP and over TCP. A reply must carry the request's transaction id and the magic cookie and have a length that matches the message, and a UDP reply must come from the address the request went to; anything else is ignored (UDP) or fails the query (TCP). XOR-MAPPED-ADDRESS is used, with MAPPED-ADDRESS as the fallback for old servers; an error response, an unknown comprehension-required attribute, a truncated attribute, a zero port or an unspecified address fails the query. UDP requests are retransmitted 3 times (0.5 s, doubling), a TCP query gets 5 s in all, name resolution gets 3 s, and a TCP reply declaring a body over 1 KB is refused before it is read. The servers are configurable (`stun_servers=[(host, port), ...]`); the defaults are in `stun.DEFAULT_UDP_SERVERS` and `stun.DEFAULT_TCP_SERVERS`.
+   - **Mapping test.** After a join, a node the introduction server found not reachable asks up to 4 STUN servers at once, over TCP, from a socket bound to its listening port (`SO_REUSEADDR` and `SO_REUSEPORT`, so it shares the port with the listener). Servers at different IPs that all report the same address mean the NAT keeps one external port per local port (`endpoint-independent`); different ports mean `endpoint-dependent` ("symmetric") mapping, and the node then **does not hole punch**, because the port a peer would be told is not the one the NAT would use for that peer. Fewer than two answers from different IPs is `unknown`, and the node carries on (it punches). The result is `P2PNode.nat_mapping`.
+   - **Fails soft.** No STUN server answering, or any error, only leaves the mapping `unknown`. The result is not required for anything else.
+   - **STUN addresses are never handed to peers.** `P2PNode.stun_address` is for information only. A punch uses only addresses the introduction server observed (see below), so a STUN-reported port is never used, whatever IP it carries.
+   - **Which default servers answer.** Checked on 2026-10-30 from one machine: all of the UDP defaults answer (Google, Cloudflare, Twilio, Nextcloud, Telnyx). Over TCP only some public servers answer: Google, Cloudflare and Twilio did not within 5 s, while Nextcloud, Telnyx, SignalWire and the BlackBerry server did, so the TCP defaults are those four. Public servers change; the optional live tests (`P2P_NET_LIVE_STUN=1 python -m pytest tests/test_stun.py -k live`) query them.
+6. **TCP hole punching (optional, `P2PNode(..., hole_punching=True)`).** Two peers that cannot dial each other can still get a direct TCP connection if each one `connect()`s to the other's public endpoint at about the same time, from the port its NAT already maps: each NAT sees an outbound SYN, has a mapping, and lets the other side's SYN through (a TCP simultaneous open). The protocol is described at the top of `punch.py`.
+   - **Message flow.** A punching node opens its relay channel from its listening port (so the server sees the NAT's mapping of that port) and registers it with `"punch": true`. To reach contact B, node A opens a short connection to the introduction server with `{"type": "punch", "from", "token", "to"}`. The server checks A's token, B's registered punching channel and the limits below, then sends B a `punch_go` on its channel with a random secret `id` and the endpoint it observed for A, and sends A a `punch_go` with the same `id` and the endpoint it observed for B. Both then call `connect()` to the other's endpoint from their listening port, retrying every 0.25 s for at most 6 s (`PUNCH_WINDOW`; each attempt at most 2 s), and also accept on the listening port, since one side's SYN can reach the other's listener instead of crossing. Whichever connection comes up, both ends send `PUNCH <id>` and check the other's. A connection that reached the listener must also come from the IP the server named. A peer the server could dial back and that has no channel (a reachable peer that starts a punch toward an unreachable one) is given as its listening port on the IP the dial-back reached.
+   - **Order in `KademliaNode._exchange`.** Direct dial, then a punched connection, then the relay. A contact known to be unreachable skips the dial and goes punched, relay, then the dial as a last resort. A failed punch falls back to the relay when the punch window (6 s) runs out and is not retried for that contact for 60 s (`PUNCH_RETRY_DELAY`), so a peer behind a symmetric NAT does not make every request pay for a punch. The relay is not used when the contact accepted the connection but did not answer, as before.
+   - **Reuse.** A successful connection is kept as a channel and used for later requests to that contact, in both directions and many at once, until it has been silent for 60 s (`PUNCH_IDLE_TIMEOUT`) or a request on it fails. It is kept because a NAT mapping belongs to one flow: a new connection to the same peer would have to be punched again. Frames are a kind byte, a 4-byte request id and a DHT message of at most 1 MB.
+   - **Old peers and servers.** Without `hole_punching` a node behaves exactly as before, and an old node that is sent a `PUNCH` hello treats it as an unknown command. The join reply carries `punch_supported`; against a server that does not send it a node keeps using the relay. A peer that did not register with `"punch": true` is never sent a `punch_go`, and a punch to it fails at once so the caller relays. Port 0 and an `endpoint-dependent` STUN result also turn punching off.
+   - **Security guards** (module constants in `introduction_server.py` and `punch.py`):
+     - *Only joined peers.* A punch request needs the sender's virtual ip and `relay_token`, and the target must have a registered punching channel.
+     - *Only server-observed addresses.* Each side is told the endpoint the server saw the other's channel come from (or the dial-back address), never one the peer claims, and the server dials no one. The server connects to no one for a punch, and a peer can only get others to connect to the address the server saw it at. A `punch_go` is only acted on if it names a real unicast IP and port 1-65535 and the peer dials that one endpoint, for at most the punch window.
+     - *Hello check.* The secret id is known only to the two peers; an inbound connection with another id, from another IP, or arriving twice is closed.
+     - *Limits:*
+
+       | Constant | Value | Effect |
+       | --- | --- | --- |
+       | `PUNCH_RATE_LIMIT` / `PUNCH_RATE_WINDOW` | 10 per 10 s | Punch requests per sending peer (refused ones count). |
+       | `MAX_PENDING_PUNCHES_PER_SENDER` / `_PER_PEER` / `MAX_PENDING_PUNCHES` | 4 / 4 / 64 | Punches in progress per sender, per target and in total. A slot is held until the initiator closes its connection or `PUNCH_SESSION_TIMEOUT` (10 s) passes. |
+       | `PUNCH_MAX_ATTEMPTS` / `PUNCH_MAX_RESPONSES` | 4 / 4 | Punches a node starts / joins at once. |
+       | `MAX_PUNCHED_CHANNELS` | 32 | Punched connections a node holds. |
+       | `PUNCH_MAX_INFLIGHT` | 16 | Requests in flight on one channel, each way. |
+       | `PUNCH_REQUEST_TIMEOUT` / `PUNCH_WRITE_TIMEOUT` | 10 s | A request without a reply; a peer that stops reading drops the channel. |
+
+   - **Cleanup.** `P2PNode.stop()` cancels punches under way and closes every punched connection. Sockets that share the listening port reset their connection when closed (`SO_LINGER` 0), because a TIME_WAIT entry would stop the next `connect()` from that port to the same peer.
+   - **Not private, not authenticated beyond the above.** The channel is plain TCP; DHT records are verified end to end as on any path.
+   - **Limits.**
+     - *Symmetric NAT:* the external port differs per destination, so the port the server observed is not the port the peer would see. A node whose STUN test says so does not try; without STUN (or with an `unknown` result) it tries and fails after the window, then relays.
+     - *Carrier-grade NAT (CGNAT)* and any NAT that does not keep one mapping for the listening port, or that gives the peers different mappings by destination, fail the same way.
+     - *Firewalls that drop unsolicited SYNs* are the case punching is made for: each side's outgoing SYN opens its own firewall for the other's. It fails when a NAT or firewall instead answers an unsolicited SYN with a RST, or forgets the mapping when that SYN is refused, when it blocks the outgoing connection (a corporate firewall that only allows web traffic, or one that filters by destination), and with a NAT whose mapping times out before the peers connect.
+     - *Needs a fixed listening port.* The server only sees the mapping of the relay channel's connection, so punching works only if the NAT gives the later punch connections from that port the same external port.
+     - *Only IPv4 was tested.*
+     - *Shared listening port.* Punching and the STUN test connect out from the listening port, so the listener is opened with `SO_REUSEPORT`. On Linux that also lets another process of the same user bind the port; run the node as its own user if that matters.
+     - *Both peers must be online* and connected to the same introduction server; the relay remains the fallback.
+
 | Part | Status |
 | --- | --- |
 | Reflexive address discovery | Implemented. Reported by the Introduction Server, not used for what a node advertises. |
 | Reachability check | Implemented (dial-back to the peer's own IP only). |
 | Relay through the Introduction Server | Implemented for DHT messages. |
 | UPnP port mapping | Implemented, optional. Tested only against a fake `miniupnpc`. |
-| TCP hole punching | Not implemented. |
-| STUN | Not implemented; the observed address comes only from the Introduction Server. |
+| STUN | Implemented (UDP and TCP Binding requests), optional. Used only for the NAT mapping test; its addresses are never sent to peers. Tested against a fake STUN server; the default servers were also queried live once. |
+| NAT mapping test | Implemented, optional, TCP from the listening port. |
+| TCP hole punching | Implemented, optional, off by default. **Tested only on loopback in simulation; it has never run through a real NAT.** |
 
-**How it was tested.** Only in simulation, on one machine. No real NAT, router or `miniupnpc` was used. A peer "behind a NAT" in the tests is a node that advertises a port nothing listens on (or never starts listening), so the server's dial-back and every direct dial to it fail; the Introduction Server, the relay and the nodes are real code talking over loopback TCP. UPnP is tested against a stand-in `miniupnpc` module. Behaviour with real NAT types, a real router, or an Introduction Server across the internet has not been checked. TCP hole punching is left out because it cannot be tested here without a real NAT, and a test on one machine would not show whether it works against one.
+**How it was tested.** Only in simulation, on one machine. No real NAT, router or `miniupnpc` was used. A peer "behind a NAT" in the tests is a node that advertises a port nothing listens on (or never starts listening), so the server's dial-back and every direct dial to it fail; the Introduction Server, the relay and the nodes are real code talking over loopback TCP. UPnP is tested against a stand-in `miniupnpc` module.
+- **Hole punching** is tested on loopback only. The stand-in NAT is a listening socket on the node's port with a full accept queue, so the kernel silently drops every SYN that is not part of a connection the node itself started. That gives a real TCP simultaneous open between two nodes on 127.0.0.1, and the tests check that the punched connection (not the relay) carries the traffic and that a failed punch falls back to the relay. It leaves out address and port translation, mapping timeouts, NATs that answer an unsolicited SYN with a RST, and everything else about real routers. **Whether hole punching works through a real NAT is not known.**
+- **STUN** is tested against a fake server over UDP and TCP (wrong transaction ids, truncated and garbage packets, timeouts, XOR decoding, hostile lengths). The live tests, skipped unless `P2P_NET_LIVE_STUN` is set, query the public servers and showed on 2026-10-30 that the defaults answer (see above); they also reported this machine's UDP and TCP mapping as endpoint-independent, which says nothing about other networks.
+- **Mutation checks.** Each guard and limit of the STUN client, the punch client and the introduction server's punch code (131 of them: checks of ids, sources, lengths, ports and addresses, every cap, rate limit and timeout, the cleanup in `stop()`, the order of paths in `_exchange`) was broken in a scratch copy and the suite run: 129 broke a test. The other two change nothing the tests can see: a dial's writer that is not closed explicitly is still closed when it is garbage collected, and a channel's reader task ends anyway when its writer is closed. A test that hangs now fails after 30 s (`tests/conftest.py`).
+- Behaviour with real NAT types, a real router, or an Introduction Server across the internet has not been checked.
 
 ## **Implementation Details**
 
@@ -220,7 +261,7 @@ A peer behind a NAT that refuses inbound connections can still make outgoing con
 Planned enhancements include:
 - **Browser Integration:** Developing a custom browser to interact with this P2P network.
 - **Clear Web Access:** Enabling access to traditional websites via this protocol.
-- **Enhanced NAT Traversal:** TCP hole punching (coordinated through the Introduction Server) and STUN, neither of which exists yet, and testing against real NATs.
+- **Enhanced NAT Traversal:** testing hole punching against real NATs (it has only been simulated on loopback), UDP-based punching and IPv6.
 - **Demo Application:** A complete demo showcasing the protocol in action.
 
 ## **Getting Started**
@@ -269,7 +310,11 @@ and if it is not the node opens its relay channel by itself and uses the
 relay to reach contacts it cannot dial. `P2PNode.observed_address`,
 `directly_reachable` and `virtual_ip` hold what the server reported. For UPnP,
 install the optional package (`pip install miniupnpc`); `P2PNode(ip, port,
-upnp=False)` skips it.
+upnp=False)` skips it. For hole punching create the node with
+`P2PNode(ip, port, hole_punching=True)` (it needs a fixed port), and add
+`stun=True` (and optionally `stun_servers=[(host, port), ...]`) to skip
+punching behind a NAT that gives every destination its own port;
+`nat_mapping` and `stun_address` hold the result. Both are off by default.
 
 Run the tests with `python -m pytest` (they need `pytest` and
 `pytest-asyncio`, and keep all key files in temporary directories; they never
