@@ -14,6 +14,7 @@ from kademlia_dht import (
     safe_text,
     write_frame,
 )
+from punch import PUNCH_SESSION_TIMEOUT
 from relay import (
     MAX_RELAY_FRAME_SIZE,
     MAX_RELAYED_MESSAGE_SIZE,
@@ -42,6 +43,19 @@ RELAY_RATE_WINDOW = 1.0
 # reading), and the channel is dropped.
 RELAY_WRITE_TIMEOUT = READ_TIMEOUT
 
+# TCP hole punching limits; the protocol is described in punch.py. A punch
+# holds the initiator's connection from the request until the peers are done
+# (at most PUNCH_SESSION_TIMEOUT after the go). Punches in progress are
+# capped per sender (as many as a peer runs at once), per target and in
+# total, and a sender's requests are rate limited, since each one sets a
+# target off connecting to the sender. The server never dials anyone for a
+# punch.
+MAX_PENDING_PUNCHES_PER_SENDER = 4
+MAX_PENDING_PUNCHES_PER_PEER = 4
+MAX_PENDING_PUNCHES = 64
+PUNCH_RATE_LIMIT = 10
+PUNCH_RATE_WINDOW = 10.0
+
 
 class IntroductionServer:
     def __init__(self, network: str = VIRTUAL_NETWORK):
@@ -65,6 +79,12 @@ class IntroductionServer:
         self.relay_channels = {}   # virtual ip -> writer of its channel
         self.pending_relays = {}   # relay id -> {'from','to','channel','future'}
         self._relay_times = {}     # virtual ip -> deque of recent request times
+        # Hole punching state: see punch.py. The channels (writers) of peers
+        # that registered as taking part, the punches in progress and each
+        # sender's recent punch times.
+        self.punch_channels = set()
+        self.pending_punches = {}  # punch id -> {'from', 'to'}
+        self._punch_times = {}
 
     def assign_virtual_ip(self):
         if self.released_ips:
@@ -85,6 +105,7 @@ class IntroductionServer:
         if channel is not None:
             channel.close()
         self._relay_times.pop(virtual_ip, None)
+        self._punch_times.pop(virtual_ip, None)
         self.released_ips.add(ip)
 
     def find_nearby_peers(self, public_ip, count=5):
@@ -156,6 +177,8 @@ class IntroductionServer:
             await self._handle_relay_register(reader, writer, request)
         elif kind == 'relay':
             await self._handle_relay(reader, writer, request)
+        elif kind == 'punch':
+            await self._handle_punch(reader, writer, request)
         else:
             print(f"Unknown connection type {safe_text(kind)}; dropping it")
             await self._close(writer)
@@ -183,6 +206,8 @@ class IntroductionServer:
             'virtual_ip': virtual_ip,
             'observed_address': {'ip': observed_ip, 'port': observed_port},
             'directly_reachable': directly_reachable,
+            # This server coordinates TCP hole punches (see punch.py).
+            'punch_supported': True,
             'nearby_peers': nearby_peers,
         }
 
@@ -252,6 +277,11 @@ class IntroductionServer:
         self.relay_channels[virtual_ip] = writer
         if old is not None:
             old.close()
+        # A peer that says it does hole punching gets punch_go frames on its
+        # channel, and this channel's address is where a punch sends the
+        # peer's peers; the flag lasts as long as this channel.
+        if request.get('punch') is True:
+            self.punch_channels.add(writer)
         print(f"Relay channel registered for {virtual_ip}")
 
         try:
@@ -279,6 +309,7 @@ class IntroductionServer:
         finally:
             if self.relay_channels.get(virtual_ip) is writer:
                 del self.relay_channels[virtual_ip]
+            self.punch_channels.discard(writer)
             self._fail_pending_relays(writer, "the relayed peer disconnected")
             await self._close(writer)
 
@@ -302,13 +333,18 @@ class IntroductionServer:
     def _check_relay_rate(self, from_vip):
         """Count a relay request against the sender's rate limit (a sliding
         window of recent requests, refused ones included)."""
+        self._check_rate(self._relay_times, from_vip, RELAY_RATE_LIMIT,
+                         RELAY_RATE_WINDOW, "relay")
+
+    @staticmethod
+    def _check_rate(times_by_peer, from_vip, limit, window, what):
         now = asyncio.get_running_loop().time()
-        times = self._relay_times.setdefault(from_vip, deque())
-        while times and now - times[0] > RELAY_RATE_WINDOW:
+        times = times_by_peer.setdefault(from_vip, deque())
+        while times and now - times[0] > window:
             times.popleft()
-        if len(times) >= RELAY_RATE_LIMIT:
-            raise ValueError(f"rate limit: more than {RELAY_RATE_LIMIT} relay "
-                             f"requests per {RELAY_RATE_WINDOW}s")
+        if len(times) >= limit:
+            raise ValueError(f"rate limit: more than {limit} {what} "
+                             f"requests per {window}s")
         times.append(now)
 
     async def _send_to_channel(self, channel, message):
@@ -392,6 +428,108 @@ class IntroductionServer:
             raise ValueError(f"the relayed reply is over the "
                              f"{MAX_RELAYED_MESSAGE_SIZE}-byte cap")
         return {'type': 'relay_reply', 'payload': message['payload']}
+
+    # --- TCP hole punching ---
+    # The protocol is described in punch.py. The server only introduces two
+    # joined peers: it hands each the address it observed for the other,
+    # never one that a peer claims, and dials no one.
+
+    def _punch_endpoint(self, virtual_ip):
+        """The address a punch sends a peer's peer to, or None if the peer
+        cannot take part. That is where the peer's relay channel connection
+        comes from (the NAT's mapping of the listening port, when the peer
+        opened the channel from it as a punching peer does), or for a peer
+        this server could dial back, the address the dial-back reached."""
+        channel = self.relay_channels.get(virtual_ip)
+        if channel is not None and channel in self.punch_channels:
+            address = channel.get_extra_info('peername')
+            return address[:2] if address else None
+        peer = self.peers[virtual_ip]
+        if channel is None and peer.get('directly_reachable'):
+            return peer['observed_ip'], peer['port']
+        return None
+
+    async def _handle_punch(self, reader, writer, request):
+        """Start one punch for the initiating peer, whose connection this is;
+        on failure write why as a single frame."""
+        try:
+            await self._punch_one(reader, writer, request)
+        except (asyncio.IncompleteReadError, ConnectionResetError,
+                BrokenPipeError, OSError, ValueError) as e:
+            try:
+                await write_frame(writer, json.dumps(
+                    {'type': 'punch_failed',
+                     'error': str(e) or type(e).__name__}).encode())
+            except OSError:
+                pass  # the initiator went away
+        await self._close(writer)
+
+    async def _punch_one(self, reader, writer, request):
+        from_vip, to_vip = request.get('from'), request.get('to')
+        if (not self._is_peer(from_vip, request.get('token'))
+                or not isinstance(to_vip, str) or to_vip not in self.peers):
+            raise ValueError("punching is only between peers that joined")
+        self._check_rate(self._punch_times, from_vip, PUNCH_RATE_LIMIT,
+                         PUNCH_RATE_WINDOW, "punch")
+        channel = self.relay_channels.get(to_vip)
+        if channel is None:
+            raise ValueError(f"{to_vip} has no relay channel")
+        if channel not in self.punch_channels:
+            raise ValueError(f"{to_vip} does not do hole punching")
+        target_endpoint = self._punch_endpoint(to_vip)
+        initiator_endpoint = self._punch_endpoint(from_vip)
+        if target_endpoint is None or initiator_endpoint is None:
+            raise ValueError("no address is known for "
+                             + (to_vip if target_endpoint is None else from_vip))
+        pending = list(self.pending_punches.values())
+        if sum(p['from'] == from_vip for p in pending) >= MAX_PENDING_PUNCHES_PER_SENDER:
+            raise ValueError(f"too many punches already running from {from_vip}")
+        if sum(p['to'] == to_vip for p in pending) >= MAX_PENDING_PUNCHES_PER_PEER:
+            raise ValueError(f"too many punches already running to {to_vip}")
+        if len(pending) >= MAX_PENDING_PUNCHES:
+            raise ValueError("too many punches in progress")
+
+        # The slot is held from here until the initiator is done.
+        punch_id = secrets.token_urlsafe(16)
+        self.pending_punches[punch_id] = {'from': from_vip, 'to': to_vip}
+        try:
+            # Each side gets the address observed for the other, and only
+            # that. The target first: if it cannot be told, the initiator
+            # hears only that the punch failed.
+            await self._send_to_channel(channel, {
+                'type': 'punch_go', 'id': punch_id, 'from': from_vip,
+                'peer': {'ip': initiator_endpoint[0],
+                         'port': initiator_endpoint[1]}})
+            await self._send_frame(writer, {
+                'type': 'punch_go', 'id': punch_id,
+                'peer': {'ip': target_endpoint[0], 'port': target_endpoint[1]}})
+            print(f"Punch {from_vip} -> {to_vip} started")
+            await self._wait_closed(reader, PUNCH_SESSION_TIMEOUT)
+        finally:
+            del self.pending_punches[punch_id]
+
+    async def _send_frame(self, writer, message):
+        """Write one JSON frame to the initiator of a punch, bounded like a
+        channel write."""
+        try:
+            await asyncio.wait_for(
+                write_frame(writer, json.dumps(message).encode()),
+                RELAY_WRITE_TIMEOUT)
+        except asyncio.TimeoutError:
+            writer.transport.abort()
+            raise ValueError("the initiator is not reading its connection")
+
+    @staticmethod
+    async def _wait_closed(reader, timeout):
+        """Discard what the peer sends until it closes the connection, or
+        `timeout` seconds pass."""
+        async def discard():
+            while await reader.read(1024):
+                pass
+        try:
+            await asyncio.wait_for(discard(), timeout)
+        except asyncio.TimeoutError:
+            pass
 
     async def start_server(self, host, port):
         server = await asyncio.start_server(
